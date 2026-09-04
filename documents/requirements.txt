@@ -1,0 +1,19 @@
+# Dépendances de l'application (assistant IA + multi-agent)
+# Environnement cible : SageMaker AI Studio, auth via rôle IAM.
+#
+# Le module multi-agent n'ajoute AUCUNE dépendance externe :
+# la parallélisation utilise concurrent.futures (bibliothèque standard).
+
+# Interface
+streamlit>=1.36
+
+# Accès Amazon Bedrock
+boto3>=1.34
+botocore>=1.34
+
+# Couche LangChain / Bedrock Converse
+langchain-aws>=0.2
+langchain-core>=0.3
+
+# Orchestration d'agents (agent ReAct de l'assistant principal)
+langgraph>=0.2

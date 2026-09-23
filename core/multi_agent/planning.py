@@ -1,0 +1,335 @@
+"""Validation et compilation déterministes d'un plan multi-agent."""
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from typing import Any
+
+from core.multi_agent.ledger import STATE_PLANIF, Task, TaskLedger
+from core.multi_agent.roles import ASSIGNABLE_TIERS
+
+MAX_TASKS = 24
+MIN_TASKS = 3
+MAX_TEXT_LENGTH = 30_000
+MAX_FIELD_LENGTH = 8_000
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+# Défauts JSON récurrents des sorties de modèles.
+_TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
+_LINE_COMMENT_RE = re.compile(r"(?<![:\"'\w])//[^\n]*")
+_PYTHON_LITERAL_RE = re.compile(r"(?<![\"\w])(True|False|None)(?![\"\w])")
+_PYTHON_LITERALS = {"True": "true", "False": "false", "None": "null"}
+
+
+class PlanError(ValueError):
+    """Plan invalide ou impossible à interpréter.
+
+    ``semantic`` distingue une erreur de CONTENU (plan compréhensible mais non
+    conforme aux règles : trop peu de tâches, dépendance impossible...) d'une
+    erreur de FORMAT (JSON illisible). La réparation demandée au Chef diffère :
+    reformater sans changer le sens, ou corriger réellement le plan.
+    """
+
+    def __init__(self, message: str, *, semantic: bool = False) -> None:
+        super().__init__(message)
+        self.semantic = semantic
+
+
+@dataclass(frozen=True)
+class PlanReport:
+    task_count: int
+    tiers_used: dict[str, int]
+    corrections: list[str]
+    assumptions: list[str]
+    review_task_count: int = 0
+
+
+def repair_common_json_defects(text: str) -> str:
+    """Corrige les défauts JSON les plus fréquents des sorties de modèles.
+
+    Traite, sans jamais changer le sens du plan :
+    - les littéraux Python ``True`` / ``False`` / ``None`` ;
+    - les virgules finales avant ``}`` ou ``]`` ;
+    - les commentaires ``//`` en fin de ligne.
+
+    La fonction reste volontairement conservatrice : elle n'essaie pas de
+    deviner des guillemets manquants, ce qui produirait un plan faux.
+    """
+    repaired = _TRAILING_COMMA_RE.sub(r"\1", text)
+    repaired = _LINE_COMMENT_RE.sub("", repaired)
+    repaired = _PYTHON_LITERAL_RE.sub(
+        lambda match: _PYTHON_LITERALS[match.group(0)], repaired
+    )
+    return repaired
+
+
+def extract_json_block(raw: str) -> str:
+    """Extrait le premier objet JSON décodable d'une réponse textuelle."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise PlanError("Réponse de planification vide.")
+    if len(raw) > MAX_TEXT_LENGTH:
+        raise PlanError(
+            f"Réponse de planification trop longue ({len(raw)} caractères)."
+        )
+
+    cleaned = raw.strip()
+    fenced = _FENCE_RE.search(cleaned)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+
+    decoder = json.JSONDecoder()
+    saw_opening_brace = False
+    last_error: json.JSONDecodeError | None = None
+
+    # Deuxième passe sur une version réparée : les modèles produisent
+    # régulièrement des virgules finales ou des littéraux Python.
+    for candidate in (cleaned, repair_common_json_defects(cleaned)):
+        for index, character in enumerate(candidate):
+            if character != "{":
+                continue
+            saw_opening_brace = True
+            try:
+                _, end = decoder.raw_decode(candidate[index:])
+                return candidate[index : index + end]
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+    if not saw_opening_brace:
+        raise PlanError("Aucun objet JSON détecté dans le plan.")
+
+    preview = cleaned[:500].replace("\n", "\\n")
+    truncation_hint = (
+        " La réponse semble coupée avant la fin (accolade finale absente) : "
+        "réduis le nombre de tâches ou raccourcis les descriptions."
+        if cleaned.count("{") > cleaned.count("}")
+        else ""
+    )
+    raise PlanError(
+        "Objet JSON détecté mais invalide"
+        + (f" : {last_error}" if last_error else "")
+        + f".{truncation_hint} Aperçu : {preview!r}"
+    )
+
+
+def parse_plan(raw: str) -> dict[str, Any]:
+    block = extract_json_block(raw)
+    try:
+        data = json.loads(block)
+    except json.JSONDecodeError as exc:
+        preview = block[:500].replace("\n", "\\n")
+        raise PlanError(f"JSON du plan invalide : {exc}. Aperçu : {preview!r}") from exc
+
+    if not isinstance(data, dict):
+        raise PlanError("Le plan doit être un objet JSON.")
+    if set(data) - {"objective", "assumptions", "tasks"}:
+        # Les champs supplémentaires de premier niveau sont tolérés mais ignorés.
+        pass
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise PlanError(
+            "Le plan doit contenir une liste 'tasks' non vide.", semantic=True
+        )
+    if len(tasks) < MIN_TASKS:
+        raise PlanError(
+            f"Le plan doit contenir au moins {MIN_TASKS} tâches. Décompose "
+            "systématiquement en : (1) analyse/consultation préalable, "
+            "(2) production du livrable, (3) vérification indépendante. "
+            f"Reçu : {len(tasks)}. Crée davantage de tâches distinctes.",
+            semantic=True,
+        )
+    if len(tasks) > MAX_TASKS:
+        raise PlanError(
+            f"Le plan dépasse la limite de {MAX_TASKS} tâches.", semantic=True
+        )
+    return data
+
+
+def _make_task_id(index: int) -> str:
+    return f"T{index + 1:02d}"
+
+
+def _clean_text(value: object, field: str, where: str, required: bool = True) -> str:
+    text = str(value or "").strip()
+    if required and not text:
+        raise PlanError(f"{where} : '{field}' est obligatoire.", semantic=True)
+    if len(text) > MAX_FIELD_LENGTH:
+        raise PlanError(
+            f"{where} : '{field}' dépasse {MAX_FIELD_LENGTH} caractères.", semantic=True
+        )
+    return text
+
+
+def _normalize_tier(value: object, corrections: list[str], where: str) -> str:
+    tier = str(value or "").strip().lower()
+    if tier in ASSIGNABLE_TIERS:
+        return tier
+    corrections.append(f"{where} : tier {value!r} remplacé par 'fast'.")
+    return "fast"
+
+
+def _clean_string_list(value: object, field: str, where: str) -> list[str]:
+    if value is None:
+        return []
+    # Une chaîne unique est acceptée et normalisée en liste d'un élément.
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        raise PlanError(f"{where} : '{field}' doit être une liste.", semantic=True)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = _clean_text(item, field, where, required=False)
+        key = text.casefold()
+        if text and key not in seen:
+            cleaned.append(text)
+            seen.add(key)
+    return cleaned
+
+
+def _resolve_dependencies(
+    value: object,
+    self_index: int,
+    task_count: int,
+    where: str,
+    corrections: list[str],
+) -> list[int]:
+    """Normalise depends_on en ignorant les entrées inexploitables.
+
+    Une dépendance fantaisiste (indice hors limites, référence vers une tâche
+    ultérieure, valeur non entière) ne justifie pas de rejeter tout le plan :
+    elle est retirée et l'ajustement est tracé dans le rapport.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        corrections.append(f"{where} : 'depends_on' n'est pas une liste, ignoré.")
+        return []
+    valid: list[int] = []
+    for dependency in value:
+        if isinstance(dependency, bool) or not isinstance(dependency, int):
+            corrections.append(
+                f"{where} : dépendance {dependency!r} non entière, ignorée."
+            )
+            continue
+        if dependency < 0 or dependency >= task_count:
+            corrections.append(
+                f"{where} : dépendance {dependency} hors limites, ignorée."
+            )
+            continue
+        if dependency >= self_index:
+            corrections.append(
+                f"{where} : dépendance {dependency} vers une tâche ultérieure, ignorée."
+            )
+            continue
+        if dependency not in valid:
+            valid.append(dependency)
+    return valid
+
+
+def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
+    data = parse_plan(raw_plan)
+    raw_tasks = data["tasks"]
+    corrections: list[str] = []
+    assumptions = _clean_string_list(data.get("assumptions"), "assumptions", "Plan")
+    objective = _clean_text(data.get("objective"), "objective", "Plan")
+    identifiers = {index: _make_task_id(index) for index in range(len(raw_tasks))}
+    ledger = TaskLedger(objective=objective, state=STATE_PLANIF)
+    tiers_used: dict[str, int] = {}
+    review_count = 0
+
+    for index, raw_task in enumerate(raw_tasks):
+        where = f"Tâche {index + 1}"
+        if not isinstance(raw_task, dict):
+            raise PlanError(f"{where} : objet attendu.", semantic=True)
+
+        title = _clean_text(raw_task.get("title"), "title", where)
+        description = _clean_text(raw_task.get("description"), "description", where)
+        expected_output = _clean_text(
+            raw_task.get("expected_output"), "expected_output", where, required=False
+        )
+        if not expected_output:
+            expected_output = "Livrable textuel répondant à l'instruction."
+            corrections.append(f"{where} : 'expected_output' manquant, valeur par défaut appliquée.")
+        criteria = _clean_string_list(
+            raw_task.get("acceptance_criteria"), "acceptance_criteria", where
+        )
+        if not criteria:
+            criteria = ["Le livrable répond entièrement à l'instruction de la tâche."]
+            corrections.append(
+                f"{where} : aucun critère d'acceptation fourni, critère générique appliqué."
+            )
+
+        tier = _normalize_tier(raw_task.get("assigned_tier"), corrections, where)
+        dependency_indices = _resolve_dependencies(
+            raw_task.get("depends_on"), index, len(raw_tasks), where, corrections
+        )
+        requires_review = raw_task.get("requires_review")
+        if not isinstance(requires_review, bool):
+            # Un champ absent ou mal typé ne doit pas invalider tout le plan :
+            # l'absence de revue est le comportement par défaut le plus sûr.
+            if requires_review is not None:
+                corrections.append(
+                    f"{where} : 'requires_review' non booléen, interprété comme false."
+                )
+            requires_review = False
+        review_count += int(requires_review)
+
+        enriched_description = (
+            f"{description}\n\nSortie attendue : {expected_output}"
+            "\n\nCritères d'acceptation :\n"
+            + "\n".join(f"- {criterion}" for criterion in criteria)
+        )
+        if requires_review:
+            enriched_description += (
+                "\n\nRevue humaine ou critique ciblée requise avant synthèse."
+            )
+
+        ledger.add_task(
+            Task(
+                id=identifiers[index],
+                title=title,
+                description=enriched_description,
+                assigned_tier=tier,
+                requires_review=requires_review,
+                dependencies=[identifiers[item] for item in dependency_indices],
+            )
+        )
+        tiers_used[tier] = tiers_used.get(tier, 0) + 1
+
+    _check_no_cycle(ledger)
+    for assumption in assumptions:
+        ledger.log_decision(f"Hypothèse de planification : {assumption}")
+
+    return ledger, PlanReport(
+        task_count=len(raw_tasks),
+        tiers_used=tiers_used,
+        corrections=corrections,
+        assumptions=assumptions,
+        review_task_count=review_count,
+    )
+
+
+def _check_no_cycle(ledger: TaskLedger) -> None:
+    graph = {task.id: list(task.dependencies) for task in ledger.tasks}
+    states: dict[str, int] = {}
+    stack: list[str] = []
+
+    def visit(node: str) -> None:
+        state = states.get(node, 0)
+        if state == 2:
+            return
+        if state == 1:
+            start = stack.index(node) if node in stack else 0
+            cycle = " -> ".join(stack[start:] + [node])
+            raise PlanError(f"Cycle de dépendances détecté : {cycle}.", semantic=True)
+        states[node] = 1
+        stack.append(node)
+        for dependency in graph.get(node, []):
+            if dependency not in graph:
+                raise PlanError(f"Dépendance inconnue : {dependency}.")
+            visit(dependency)
+        stack.pop()
+        states[node] = 2
+
+    for task_id in graph:
+        visit(task_id)

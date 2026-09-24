@@ -389,7 +389,11 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
 
     semaphore = _model_semaphore(result.model_alias, config.max_parallel_per_model)
     _emit(progress, "worker", f"{task.title} : en attente d'un creneau {result.model_alias}.", task.id)
-    for attempt in range(1, config.max_attempts + 1):
+    max_attempts = min(
+        config.max_attempts,
+        max(1, 1 + int(getattr(task, "max_retries", 1))),
+    )
+    for attempt in range(1, max_attempts + 1):
         result.attempt_count = attempt
         if cancel_event and cancel_event.is_set():
             result.error_type = "CancelledError"
@@ -402,7 +406,14 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                     raise RuntimeError("Execution annulee avant l'appel au modele.")
                 system_prompt = worker_system_prompt(tier_conf["label"])
                 task_prompt = worker_task_prompt(task.title, task.description, context)
-                if _task_requires_writing(task, context):
+                declared_capabilities = set(getattr(task, "capabilities", []) or [])
+                if "propose_write" in declared_capabilities:
+                    mode = "edition"
+                elif "read" in declared_capabilities:
+                    mode = "lecture"
+                elif "generate" in declared_capabilities:
+                    mode = "redaction"
+                elif _task_requires_writing(task, context):
                     mode = "edition"
                 elif _task_requires_reading(task, context):
                     mode = "lecture"
@@ -413,7 +424,7 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                     progress,
                     "worker",
                     f"{task.title} : appel {result.model_alias} en mode {mode} "
-                    f"(tentative {attempt}/{config.max_attempts}).",
+                    f"(tentative {attempt}/{max_attempts}).",
                     task.id,
                 )
 

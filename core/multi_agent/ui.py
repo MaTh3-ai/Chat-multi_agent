@@ -35,6 +35,7 @@ from core.multi_agent.ledger import (
     STATUS_TODO,
 )
 from core.multi_agent.orchestrator import new_chief
+from core.multi_agent.planning import estimate_plan_cost
 from core.multi_agent.run_store import (
     list_runs,
     load_run,
@@ -42,6 +43,7 @@ from core.multi_agent.run_store import (
     delete_run,
     RunStoreError,
 )
+from core.multi_agent.plan_preview import render_plan_preview_editor
 
 # Mots vides à ignorer lors de l'extraction des termes de découverte.
 _STOPWORDS = {
@@ -768,6 +770,12 @@ def _phase_planif(chief) -> None:
     st.subheader("Plan propose")
     if report is not None:
         st.caption(f"{report.task_count} tache(s), repartition : {report.tiers_used}")
+        st.metric(
+            "Budget maximal estimé",
+            f"{estimate_plan_cost(chief.ledger)} unités relatives",
+            help="Estimation conservative : exécution initiale + retries + escalades "
+            "et revue éventuelle. Ce n'est pas un prix AWS.",
+        )
         assumptions = getattr(report, "assumptions", [])
         if assumptions:
             with st.expander("Hypotheses de planification", expanded=True):
@@ -775,9 +783,32 @@ def _phase_planif(chief) -> None:
                     st.markdown(f"- {assumption}")
         for correction in report.corrections:
             st.warning(f"Ajustement automatique : {correction}")
+        for warning in getattr(report, "validation_warnings", []):
+            st.info(warning)
 
     _render_team_structure(chief)
     _render_task_board(chief)
+    
+    # Composant de prévisualisation et d'édition du plan
+    # Affiche les prompts réels (système + tâche) pour chaque worker et permet
+    # l'édition des attributs (title, description, tier, criteria, etc.).
+    # Les prompts affichés sont calculés via les mêmes fonctions que l'orchestrateur
+    # (worker_system_prompt, worker_task_prompt), garantissant la cohérence.
+    with st.expander("🔍 Prévisualiser et éditer le plan", expanded=False):
+        discovery_ctx = ""
+        if chief.discovery_report:
+            discovery_ctx = chief.discovery_report.to_context()
+        
+        edited_ledger = render_plan_preview_editor(chief.ledger, discovery_ctx)
+        
+        # Si l'utilisateur a validé des modifications, on met à jour le ledger
+        # du chef et on rafraîchit l'interface pour refléter les changements.
+        if edited_ledger is not None:
+            chief.ledger = edited_ledger
+            _save_current_run(chief)
+            st.success("Plan mis à jour avec succès.")
+            st.rerun()
+    
     left, right = st.columns(2)
     with left:
         if st.button(

@@ -75,6 +75,9 @@ class Task:
     description: str
     assigned_tier: str
     assigned_role: str = "worker"
+    capabilities: list[str] = field(default_factory=list)
+    max_retries: int = 1
+    max_escalations: int = 1
     # Revue croisee : quand requires_review vaut True, le livrable est soumis
     # a un agent critique d'un tier superieur avant la synthese.
     requires_review: bool = False
@@ -99,6 +102,9 @@ class Task:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Task":
         data = dict(raw)
+        data.setdefault("capabilities", [])
+        data.setdefault("max_retries", 1)
+        data.setdefault("max_escalations", 1)
         data["metrics"] = TaskMetrics(**data.get("metrics", {}))
         data["attempts"] = [TaskAttempt(**item) for item in data.get("attempts", [])]
         return cls(**data)

@@ -15,6 +15,9 @@ PLAN_JSON_SCHEMA = """{
       "title": "titre court orienté résultat",
       "description": "consigne autonome et bornée",
       "assigned_tier": "nano",
+      "capabilities": ["auto"],
+      "max_retries": 1,
+      "max_escalations": 1,
       "depends_on": [],
       "acceptance_criteria": ["critère observable"],
       "expected_output": "forme attendue du livrable",
@@ -91,6 +94,12 @@ CONTRAINTES SÉMANTIQUES
 - assigned_tier vaut uniquement nano, fast, smart ou expert ; réserve expert aux
   tâches réellement critiques (il est coûteux) et choisis le tier selon la
   difficulté de chaque tâche ;
+- capabilities vaut auto, read, propose_write ou generate. Utilise read pour
+  une lecture réelle, propose_write pour une proposition de modification, et
+  generate pour une réponse sans outil. auto est acceptable si le mode est
+  évident ;
+- max_retries vaut 0, 1 ou 2 et max_escalations vaut 0 ou 1. Choisis le minimum
+  nécessaire : ces champs bornent le budget de la tâche ;
 - depends_on contient uniquement des indices entiers de base 0 pointant vers
   des tâches antérieures ; laisse-le vide pour les tâches parallélisables ;
 - chaque tâche possède au moins un critère d'acceptation observable ;

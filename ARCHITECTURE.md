@@ -191,6 +191,44 @@ L'équipe mobilisée est affichée dans un tableau unique (agent, état, tâche,
 tier, modèle réel, dépendances, verdict de revue, tokens) au lieu de colonnes
 par tier devenues illisibles au-delà de trois tiers.
 
+### Hiérarchie de supervision
+
+La hiérarchie actuelle est volontairement **à un seul niveau de délégation** :
+un Chef de projet planifie et supervise un DAG de workers. Les tiers
+`nano → fast → smart → expert` représentent des capacités et des budgets de
+modèle ; ils ne représentent pas des managers récursifs.
+
+Ce choix suit un pattern de production plus robuste pour ce type d'application :
+
+- le plan est une structure déclarative validée avant exécution ;
+- les dépendances forment un DAG borné, exécuté par vagues parallèles ;
+- l'escalade de tier est automatique mais limitée par tâche et par nombre de
+  relances ;
+- une revue indépendante est déclenchée explicitement pour les livrables
+  critiques ;
+- l'humain conserve la validation du plan, des propositions d'écriture et de la
+  synthèse ;
+- les coûts, les appels et les erreurs restent observables dans le ledger.
+
+Un sous-chef ou une délégation récursive ne doit être ajouté que si un besoin
+mesurable le justifie (décomposition dynamique, budget séparé, critères
+d'acceptation propres et profondeur maximale). Sans ces garde-fous, la
+récursion augmente les coûts, la latence et le risque de boucles sans apporter
+de garantie supplémentaire.
+
+### Capacités et budgets de plan
+
+Chaque tâche peut maintenant déclarer ses capacités (`read`, `propose_write` ou
+`generate`, avec `auto` pour conserver la détection de compatibilité). Le worker
+privilégie cette déclaration et ne retombe sur les heuristiques textuelles que
+pour les anciens chantiers.
+
+Le plan borne également `max_retries` (0 à 2) et `max_escalations` (0 à 1) par
+tâche. Le ledger conserve ces paramètres pour les reprises et les restaurations.
+Avant l'exécution, l'interface affiche une estimation conservative en unités
+relatives de coût, calculée à partir du tier, des retries, des escalades et des
+revues. Il s'agit d'un indicateur de budget, pas d'un prix AWS.
+
 ### Découverte déterministe du workspace (DISCOVERY)
 
 Le Chef est instancié avec `create_chat_model()` : c'est un **modèle simple
@@ -357,23 +395,14 @@ les tâches en échec, bloquées, annulées et à revoir.
 
 ### Tests du mode multi-agent
 
-`tests/test_background_execution.py` (bibliothèque standard `unittest`, aucun
-appel Bedrock — les modèles sont remplacés par des doubles de test) couvre
-l'exécution en arrière-plan :
+`tests/test_plan_preview.py` (bibliothèque standard `unittest`, aucun appel
+Bedrock) couvre la cohérence de l'éditeur de plan :
 
-- un job expose son résultat, ses événements et son statut final ;
-- une exception du thread est capturée, jamais propagée, et sa trace est
-  conservée ;
-- l'annulation coopérative aboutit bien au statut `cancelled` ;
-- `drain()` conserve l'historique entre deux reruns Streamlit ;
-- un job ne peut pas être démarré deux fois ;
-- `run_tasks_parallel` publie la progression (attente de créneau, appel modèle,
-  avancement de la vague) ;
-- un observateur défaillant n'interrompt ni un worker ni le Chef ;
-- `execute(cancel_event=...)` armé avant le lancement ne consomme aucune tâche
-  et journalise l'interruption ;
-- `chief.log()` est bien relayé vers la file du job ;
-- une sauvegarde est déclenchée après chaque vague.
+- le format de description enrichie est identique à celui consommé par
+  l'exécution ;
+- les dépendances inconnues et les cycles sont refusés ;
+- une édition invalide ne mute pas le ledger ;
+- une édition valide conserve le format canonique attendu par le worker.
 
 ## Client Bedrock
 
@@ -388,8 +417,8 @@ l'exécution en arrière-plan :
 
 Suites présentes (bibliothèque standard `unittest`, aucun appel Bedrock) :
 
-- `tests/test_background_execution.py` : exécution en arrière-plan, progression
-  temps réel, annulation coopérative (détail ci-dessus).
+- `tests/test_plan_preview.py` : cohérence du format de description, rejet des
+  dépendances inconnues ou cycliques, et absence de mutation en cas d'erreur.
 
 Suite référencée mais absente de cette copie du dépôt :
 

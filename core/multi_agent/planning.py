@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from core.multi_agent.ledger import STATE_PLANIF, Task, TaskLedger
+from core.models import get_tier
 from core.multi_agent.roles import ASSIGNABLE_TIERS
 
 MAX_TASKS = 24
 MIN_TASKS = 3
 MAX_TEXT_LENGTH = 30_000
 MAX_FIELD_LENGTH = 8_000
+VALID_CAPABILITIES = {"auto", "read", "propose_write", "generate"}
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # Défauts JSON récurrents des sorties de modèles.
 _TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
@@ -42,6 +44,22 @@ class PlanReport:
     corrections: list[str]
     assumptions: list[str]
     review_task_count: int = 0
+    estimated_cost_units: int = 0
+    validation_warnings: list[str] = field(default_factory=list)
+
+
+def estimate_plan_cost(ledger: TaskLedger) -> int:
+    """Estime des unités relatives au pire cas, sans prétendre à un coût AWS."""
+    total = 0
+    for task in ledger.tasks:
+        tier_cost = get_tier(task.assigned_tier)["relative_cost"]
+        total += tier_cost * (
+            1 + max(0, int(getattr(task, "max_retries", 1)))
+            + max(0, int(getattr(task, "max_escalations", 1)))
+        )
+        if task.requires_review:
+            total += tier_cost
+    return total
 
 
 def repair_common_json_defects(text: str) -> str:
@@ -186,6 +204,49 @@ def _clean_string_list(value: object, field: str, where: str) -> list[str]:
     return cleaned
 
 
+def _normalize_capabilities(
+    value: object, corrections: list[str], where: str
+) -> list[str]:
+    capabilities = _clean_string_list(value, "capabilities", where)
+    if not capabilities:
+        return ["auto"]
+    normalized = [item.casefold() for item in capabilities]
+    invalid = [item for item in normalized if item not in VALID_CAPABILITIES]
+    if invalid:
+        corrections.append(
+            f"{where} : capacités inconnues ignorées ({', '.join(invalid)})."
+        )
+    valid = [item for item in normalized if item in VALID_CAPABILITIES]
+    if not valid:
+        return ["auto"]
+    if "auto" in valid and len(valid) > 1:
+        valid.remove("auto")
+    return list(dict.fromkeys(valid))
+
+
+def _bounded_int(
+    value: object,
+    field_name: str,
+    where: str,
+    corrections: list[str],
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool):
+        value = None
+    try:
+        number = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        number = default
+    bounded = max(minimum, min(number, maximum))
+    if value is not None and number != bounded:
+        corrections.append(
+            f"{where} : '{field_name}' borné à {bounded}."
+        )
+    return bounded
+
+
 def _resolve_dependencies(
     value: object,
     self_index: int,
@@ -260,6 +321,27 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
             )
 
         tier = _normalize_tier(raw_task.get("assigned_tier"), corrections, where)
+        capabilities = _normalize_capabilities(
+            raw_task.get("capabilities"), corrections, where
+        )
+        max_retries = _bounded_int(
+            raw_task.get("max_retries"),
+            "max_retries",
+            where,
+            corrections,
+            default=1,
+            minimum=0,
+            maximum=2,
+        )
+        max_escalations = _bounded_int(
+            raw_task.get("max_escalations"),
+            "max_escalations",
+            where,
+            corrections,
+            default=1,
+            minimum=0,
+            maximum=1,
+        )
         dependency_indices = _resolve_dependencies(
             raw_task.get("depends_on"), index, len(raw_tasks), where, corrections
         )
@@ -290,6 +372,9 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
                 title=title,
                 description=enriched_description,
                 assigned_tier=tier,
+                capabilities=capabilities,
+                max_retries=max_retries,
+                max_escalations=max_escalations,
                 requires_review=requires_review,
                 dependencies=[identifiers[item] for item in dependency_indices],
             )
@@ -300,12 +385,19 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
     for assumption in assumptions:
         ledger.log_decision(f"Hypothèse de planification : {assumption}")
 
+    estimated_cost_units = estimate_plan_cost(ledger)
+    validation_warnings = [
+        "L'estimation suppose le nombre maximal de reprises et d'escalades ; "
+        "le coût réel peut être inférieur.",
+    ]
     return ledger, PlanReport(
         task_count=len(raw_tasks),
         tiers_used=tiers_used,
         corrections=corrections,
         assumptions=assumptions,
         review_task_count=review_count,
+        estimated_cost_units=estimated_cost_units,
+        validation_warnings=validation_warnings,
     )
 
 

@@ -516,7 +516,11 @@ class ChefDeProjet:
             attempts = auto_retry_counts.get(task.id, 0)
             can_escalate = task.assigned_tier != "expert"
             obvious = bool(task.retryable) or can_escalate
-            if obvious and attempts < MAX_AUTO_RETRIES_PER_TASK:
+            escalation_budget = min(
+                MAX_AUTO_RETRIES_PER_TASK,
+                max(0, int(getattr(task, "max_escalations", 1))),
+            )
+            if obvious and attempts < escalation_budget:
                 auto_retry_counts[task.id] = attempts + 1
                 escalated = self.ledger.escalate_tier(task.id)
                 try:

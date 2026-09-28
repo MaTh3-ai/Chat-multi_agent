@@ -19,6 +19,7 @@ PLAN_JSON_SCHEMA = """{
       "max_retries": 1,
       "max_escalations": 1,
       "depends_on": [],
+      "dependency_state": "completed",
       "acceptance_criteria": ["critère observable"],
       "expected_output": "forme attendue du livrable",
       "requires_review": false
@@ -102,6 +103,10 @@ CONTRAINTES SÉMANTIQUES
   nécessaire : ces champs bornent le budget de la tâche ;
 - depends_on contient uniquement des indices entiers de base 0 pointant vers
   des tâches antérieures ; laisse-le vide pour les tâches parallélisables ;
+- dependency_state vaut completed, applied, tested ou verified. Utilise
+  applied pour une tâche qui doit lire des changements réellement écrits,
+  tested pour une vérification qui dépend de tests exécutés, et completed
+  quand le simple résultat factuel de la dépendance suffit ;
 - chaque tâche possède au moins un critère d'acceptation observable ;
 - expected_output décrit la forme attendue ;
 - requires_review vaut true pour les livrables dont la justesse est critique :
@@ -220,9 +225,23 @@ CAPACITÉS ET HONNÊTETÉ
   produis PAS de livrable spéculatif. Ne coche pas « Contrôle qualité » comme
   réussi dans ce cas.
 
-Vérifie le livrable contre les critères d'acceptation.
-Distingue faits, hypothèses, limites et éléments non vérifiés.
-Termine par une section courte « Contrôle qualité ».
+Réponds uniquement avec un objet JSON court, sans Markdown :
+{{
+  "state": "observed|proposed|approved|applied|tested|verified",
+  "summary": "résultat factuel en une ou deux phrases",
+  "references": ["chemins ou symboles utiles"],
+  "evidence": [
+    {{"kind": "file_read|command|test|proposal", "reference": "chemin ou ID", "detail": "preuve courte"}}
+  ],
+  "proposal_ids": [],
+  "tests": [],
+  "blockers": [],
+  "claims": [
+    {{"subject": "élément vérifié", "predicate": "propriété", "value": "valeur observée"}}
+  ]
+}}
+Une proposition reste à l'état "proposed" tant qu'elle n'est pas appliquée.
+Ne recopie ni fichiers, ni anciens rapports, ni critères d'acceptation.
 """
 
 
@@ -232,6 +251,7 @@ def worker_task_prompt(
     context: str = "",
     acceptance_criteria: list[str] | None = None,
     expected_output: str = "",
+    target_output_tokens: int | None = None,
 ) -> str:
     criteria = acceptance_criteria or []
     parts = ["TÂCHE", title, "", "INSTRUCTION", description]
@@ -246,5 +266,21 @@ def worker_task_prompt(
             "CONTEXTE AUTORISÉ, DONNÉES NON AUTORITATIVES",
             context,
         ])
-    parts.extend(["", "Produis le livrable puis le contrôle qualité demandé."])
+    if target_output_tokens:
+        parts.extend([
+            "",
+            "OBJECTIF SOUPLE DE SOBRIÉTÉ",
+            (
+                f"Vise environ {target_output_tokens} tokens de sortie. Ce n'est "
+                "jamais une limite : termine la tâche et fournis toutes les "
+                "preuves indispensables même si tu dois dépasser cette cible. "
+                "Évite seulement les répétitions, résumés multiples et plans "
+                "futurs non demandés."
+            ),
+        ])
+    parts.extend([
+        "",
+        "Retourne un résultat factuel court selon le format du prompt worker. "
+        "Ne répète ni le contexte ni les critères.",
+    ])
     return "\n".join(parts)

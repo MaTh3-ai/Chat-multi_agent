@@ -842,6 +842,29 @@ def _phase_review(chief) -> None:
     )
     _render_task_board(chief)
 
+    chief.ledger.sync_artifact_states()
+    resumed = chief.ledger.ready_tasks()
+    waiting = [
+        task for task in chief.ledger.tasks
+        if task.status == STATUS_TODO and task not in resumed
+    ]
+    if resumed:
+        if st.button(
+            f"Reprendre les tâches débloquées ({len(resumed)})",
+            key="ma_resume_ready",
+            type="primary",
+        ):
+            def _run_resume(job):
+                chief.execute(cancel_event=job.cancel_event)
+                return {"state": STATE_REVIEW}
+
+            _start_background_job(chief, "reprise après synchronisation", _run_resume)
+    elif waiting:
+        st.info(
+            f"{len(waiting)} tâche(s) attendent encore l'état appliqué/testé "
+            "d'un artefact dépendant."
+        )
+
     retryable = [
         task for task in chief.ledger.tasks
         if task.status in {STATUS_FAILED, STATUS_BLOCKED, STATUS_REVIEW}
@@ -1000,6 +1023,19 @@ def _render_run_summary(chief) -> None:
         columns[3].metric("Bloquees", summary.get("blocked", 0))
         columns[4].metric("Annulees", summary.get("cancelled", 0))
         columns[5].metric("Tokens", summary.get("total_tokens", 0))
+        efficiency = st.columns(4)
+        efficiency[0].metric("Fichiers lus", summary.get("files_read", 0))
+        efficiency[1].metric(
+            "Artefacts validés", summary.get("artifacts_validated", 0)
+        )
+        efficiency[2].metric(
+            "Tokens / artefact",
+            round(summary.get("tokens_per_validated_artifact") or 0),
+        )
+        efficiency[3].metric(
+            "Répétition moyenne",
+            f"{summary.get('average_repetition_ratio', 0.0):.1%}",
+        )
 
 
 def _render_team_structure(chief) -> None:
@@ -1047,6 +1083,7 @@ def _render_team_structure(chief) -> None:
                 "Tier": tier,
                 "Modele": _alias(tier),
                 "Depend de": ", ".join(getattr(task, "dependencies", []) or []) or "—",
+                "Barrière": getattr(task, "dependency_state", "completed"),
                 "Revue": (
                     getattr(task, "review_verdict", None)
                     or ("attendue" if getattr(task, "requires_review", False) else "—")
@@ -1099,6 +1136,13 @@ def _render_task_board(chief) -> None:
             if task.deliverable:
                 st.markdown("##### Livrable")
                 st.markdown(task.deliverable)
+            artifact = getattr(task, "artifact", None)
+            if artifact:
+                st.caption(
+                    f"Artefact : {artifact.state} | "
+                    f"révision entrée {task.input_revision[:12] or '—'} | "
+                    f"sortie {task.output_revision[:12] or '—'}"
+                )
             error = getattr(task, "error", None)
             if error:
                 st.error(error)
@@ -1111,7 +1155,9 @@ def _render_task_board(chief) -> None:
                 st.caption(
                     f"Tentatives : {getattr(task, 'attempt_count', 0)} | "
                     f"Latence : {getattr(metrics, 'latency_ms', None) or 0:.0f} ms | "
-                    f"Tokens : {getattr(metrics, 'total_tokens', None) or 0}"
+                    f"Tokens : {getattr(metrics, 'total_tokens', None) or 0} | "
+                    f"Répétition : {getattr(metrics, 'repetition_ratio', 0.0):.1%} | "
+                    f"Fichiers lus : {getattr(metrics, 'files_read', 0)}"
                 )
 
 

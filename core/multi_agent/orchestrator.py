@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import time
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -462,6 +463,7 @@ class ChefDeProjet:
                 # conservées, les suivantes ne sont pas lancées.
                 self.log("state", "Exécution interrompue à la demande de l'utilisateur.")
                 break
+            self.ledger.sync_artifact_states()
             ready = self.ledger.ready_tasks()
             if not ready:
                 break
@@ -610,9 +612,30 @@ class ChefDeProjet:
                 alias = resolve_tier_to_model_alias(reviewer_tier)
                 tier_label = get_tier(reviewer_tier)["label"]
                 model = create_chat_model(model_alias=alias, temperature=CHIEF_TEMPERATURE)
+                artifact = task.artifact
+                delta = {
+                    "state": artifact.state if artifact else "observed",
+                    "summary": artifact.summary if artifact else task.deliverable,
+                    "references": artifact.references if artifact else [],
+                    "evidence": [
+                        {
+                            "kind": item.kind,
+                            "reference": item.reference,
+                            "detail": item.detail,
+                            "hash": item.content_hash,
+                        }
+                        for item in (artifact.evidence if artifact else [])
+                    ],
+                    "input_revision": task.input_revision,
+                    "output_revision": task.output_revision,
+                }
                 output = invoke_model_with_continuation(model, [
                     ("system", critic_system_prompt(tier_label)),
-                    ("user", critic_task_prompt(task.title, task.description, task.deliverable)),
+                    ("user", critic_task_prompt(
+                        task.title,
+                        task.description,
+                        json.dumps(delta, ensure_ascii=False),
+                    )),
                 ])
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
@@ -637,6 +660,15 @@ class ChefDeProjet:
                 model_alias=alias,
             )
             if not conform:
+                self.ledger.contradictions.append({
+                    "id": f"C{len(self.ledger.contradictions) + 1:03d}",
+                    "task_ids": [task.id],
+                    "message": (
+                        f"Le livrable de {task.title} est contesté par la revue : "
+                        f"{text[:500]}"
+                    ),
+                    "resolved": False,
+                })
                 self.ledger.set_status(task.id, STATUS_REVIEW)
             verdicts.append((task.id, task.review_verdict))
             self.log(
@@ -665,11 +697,24 @@ class ChefDeProjet:
         blocked = self.ledger.tasks_with_status(STATUS_BLOCKED)
         cancelled = self.ledger.tasks_with_status(STATUS_CANCELLED)
         to_review = self.ledger.tasks_with_status(STATUS_REVIEW)
-        deliverables = [
-            f"### {task.title}\n{task.deliverable}"
-            for task in self.ledger.tasks
-            if task.deliverable
-        ]
+        deliverables = []
+        for task in self.ledger.tasks:
+            if not task.deliverable:
+                continue
+            artifact = task.artifact
+            if artifact:
+                references = ", ".join(artifact.references[:10]) or "aucune"
+                deliverables.append(
+                    f"### {task.title}\n"
+                    f"État : {artifact.state}\n"
+                    f"Résultat : {artifact.summary}\n"
+                    f"Références : {references}\n"
+                    f"Révision : {artifact.output_revision[:16]}"
+                )
+            else:
+                deliverables.append(
+                    f"### {task.title}\n{task.deliverable[:1500]}"
+                )
         incidents = [
             *(f"- Échec : {task.title} | {task.error or task.notes}" for task in failed),
             *(f"- Bloquée : {task.title} | {task.notes}" for task in blocked),
@@ -691,6 +736,9 @@ ARTEFACTS
 
 INCIDENTS
 {"\n".join(incidents) or "- Aucun incident déclaré"}
+
+CONTRADICTIONS OUVERTES
+{json.dumps([item for item in self.ledger.contradictions if not item.get("resolved")], ensure_ascii=False)}
 
 Réponds directement à l'objectif. Distingue faits, hypothèses, contradictions,
 limites et tâches manquantes. Ne présente pas une synthèse partielle comme complète.

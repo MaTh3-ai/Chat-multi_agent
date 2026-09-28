@@ -332,6 +332,16 @@ def _render_task_editor(ledger: TaskLedger, discovery_context: str) -> dict[str,
                 key=f"{key_prefix}_deps",
                 help="Tâches dont ce worker dépend (doit attendre leur livrable)"
             )
+            dependency_states = ["completed", "applied", "tested", "verified"]
+            current_dependency_state = getattr(task, "dependency_state", "completed")
+            new_dependency_state = st.selectbox(
+                "État requis des dépendances",
+                options=dependency_states,
+                index=dependency_states.index(current_dependency_state)
+                if current_dependency_state in dependency_states else 0,
+                key=f"{key_prefix}_dependency_state",
+                help="completed utilise le résultat ; applied/tested/verified attend cet état réel.",
+            )
             
             # Affichage des prompts réels
             st.markdown("##### 🤖 Prompts générés (lecture seule)")
@@ -381,6 +391,7 @@ def _render_task_editor(ledger: TaskLedger, discovery_context: str) -> dict[str,
                 description=new_description,
                 assigned_tier=new_tier,
                 dependencies=new_dependencies,
+                dependency_state=new_dependency_state,
             )
             context = build_context(ledger, preview_task, discovery_context)
             enriched_description = _enrich_description(
@@ -393,6 +404,7 @@ def _render_task_editor(ledger: TaskLedger, discovery_context: str) -> dict[str,
                 title=new_title,
                 description=enriched_description,
                 context=context,
+                target_output_tokens=1200,
             )
             if discovery_context or new_dependencies:
                 st.info(
@@ -420,6 +432,7 @@ def _render_task_editor(ledger: TaskLedger, discovery_context: str) -> dict[str,
                 "max_escalations": int(new_max_escalations),
                 "requires_review": new_requires_review,
                 "dependencies": new_dependencies,
+                "dependency_state": new_dependency_state,
             }
     
     return edited_tasks
@@ -473,6 +486,10 @@ def _apply_edits(ledger: TaskLedger, edited_tasks: dict[str, dict[str, Any]]) ->
         task.max_escalations = edits["max_escalations"]
         task.requires_review = edits.get("requires_review", task.requires_review)
         task.dependencies = edits.get("dependencies", task.dependencies)
+        dependency_state = edits.get("dependency_state", task.dependency_state)
+        if dependency_state not in {"completed", "applied", "tested", "verified"}:
+            raise ValueError(f"{task.id} contient un état de dépendance inconnu.")
+        task.dependency_state = dependency_state
         
         task.description = _enrich_description(
             edits["description"],

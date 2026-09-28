@@ -15,6 +15,7 @@ MIN_TASKS = 3
 MAX_TEXT_LENGTH = 30_000
 MAX_FIELD_LENGTH = 8_000
 VALID_CAPABILITIES = {"auto", "read", "propose_write", "generate"}
+VALID_DEPENDENCY_STATES = {"completed", "applied", "tested", "verified"}
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # Défauts JSON récurrents des sorties de modèles.
 _TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
@@ -345,6 +346,14 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
         dependency_indices = _resolve_dependencies(
             raw_task.get("depends_on"), index, len(raw_tasks), where, corrections
         )
+        dependency_state = str(
+            raw_task.get("dependency_state", "completed")
+        ).strip().casefold()
+        if dependency_state not in VALID_DEPENDENCY_STATES:
+            corrections.append(
+                f"{where} : 'dependency_state' inconnu, remplacé par completed."
+            )
+            dependency_state = "completed"
         requires_review = raw_task.get("requires_review")
         if not isinstance(requires_review, bool):
             # Un champ absent ou mal typé ne doit pas invalider tout le plan :
@@ -377,6 +386,7 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
                 max_escalations=max_escalations,
                 requires_review=requires_review,
                 dependencies=[identifiers[item] for item in dependency_indices],
+                dependency_state=dependency_state,
             )
         )
         tiers_used[tier] = tiers_used.get(tier, 0) + 1

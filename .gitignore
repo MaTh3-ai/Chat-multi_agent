@@ -1,0 +1,25 @@
+# Artefacts Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Données d'exécution locales : jamais versionnées.
+# proposals/ contient le contenu avant/après des fichiers proposés.
+# backups/ contient des copies de fichiers réels du poste.
+# workspace/ est l'espace de travail local de l'agent.
+proposals/
+backups/
+workspace/
+
+# Sorties de debug
+core/_rewriter_probe.txt
+*.sav
+
+# Environnements et secrets
+.env
+.env.*
+*.pem
+*.key

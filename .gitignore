@@ -10,9 +10,11 @@ venv/
 # proposals/ contient le contenu avant/après des fichiers proposés.
 # backups/ contient des copies de fichiers réels du poste.
 # workspace/ est l'espace de travail local de l'agent.
+# agent_runs/ contient les ledgers de chantiers (cf. core/multi_agent/run_store.py).
 proposals/
 backups/
 workspace/
+agent_runs/
 
 # Sorties de debug
 core/_rewriter_probe.txt

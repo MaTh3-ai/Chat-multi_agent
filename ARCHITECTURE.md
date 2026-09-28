@@ -126,6 +126,28 @@ telle proposition apparaissait dans l'interface sans pouvoir être approuvée.
 ### Approbation
 
 Seule l'interface peut appeler `approve_proposal()` ou `reject_proposal()`.
+
+L'interface propose aussi une validation groupée (`approve_pending_proposals`)
+et un mode optionnel de validation automatique. La validation groupée constitue
+un change set transactionnel : toutes les propositions sont prévalidées sur un
+contenu virtuel, puis écrites ensemble. Si une prévalidation ou une écriture
+échoue, aucune proposition du groupe n'est déclarée appliquée et les fichiers
+déjà remplacés sont restaurés. L'affichage est rafraîchi par un fragment
+Streamlit périodique afin de faire apparaître les nouvelles propositions sans
+actualisation manuelle.
+
+Les agents peuvent vérifier leurs changements avec `executer_commande_controlee`.
+L'outil n'utilise jamais de shell, limite l'exécutable à des outils de test ou
+de qualité autorisés, borne la durée et tronque les sorties.
+
+### Objectifs de consommation non bloquants
+
+Les workers reçoivent une cible indicative de tokens de sortie. Cette cible
+sert à encourager un résultat factuel et sans répétition, mais ne déclenche
+jamais un arrêt, un échec ou un blocage. Le worker doit aller au bout de sa
+tâche lorsque davantage de contexte est nécessaire. Un dépassement est
+simplement enregistré dans `TaskMetrics.target_output_exceeded` pour permettre
+le suivi et l'amélioration des prompts.
 À l'approbation :
 
 1. vérification du statut et de la syntaxe ;
@@ -137,6 +159,39 @@ Seule l'interface peut appeler `approve_proposal()` ou `reject_proposal()`.
 7. persistance du statut final.
 
 ## Mode multi-agent
+
+### Protocole de coordination compact
+
+Chaque worker retourne un objet JSON court contenant l'état de l'artefact,
+son résumé, ses références, ses preuves, ses tests, ses propositions et ses
+affirmations structurées. Le `TaskLedger` transforme cette sortie en `Artifact`
+persistant. Une sortie historique non structurée reste acceptée, mais elle est
+marquée comme telle et n'alimente pas automatiquement le registre de preuves.
+
+Les états d'artefact sont :
+
+`observed -> proposed -> approved -> applied -> tested -> verified`
+
+Une tâche peut demander `completed`, `applied`, `tested` ou `verified` via
+`dependency_state`. Elle ne devient exécutable que lorsque ses dépendances ont
+atteint cet état. Après approbation dans l'interface, le ledger réconcilie les
+identifiants de propositions avec leur état persistant et actualise la révision
+du workspace.
+
+`coordination.compile_context()` remplace la concaténation des rapports. Il
+transmet uniquement une découverte tronquée, les résumés d'artefacts directement
+dépendants et les contradictions ouvertes concernant la tâche. Les objectifs
+de taille restent souples et ne bloquent jamais l'exécution.
+
+Une révision stable du workspace est enregistrée avant et après chaque tâche.
+Les preuves de fichiers portent également un hash de contenu lorsqu'il peut
+être calculé. Deux affirmations structurées incompatibles sur une même révision
+créent une contradiction dans le ledger. La revue croisée reçoit le delta
+structuré et ses preuves, jamais le rapport narratif complet.
+
+Le tableau de métriques affiche les tokens, le taux de répétition, les fichiers
+réellement déclarés comme lus, les artefacts validés et les tokens par artefact
+validé. Ces mesures sont informatives et ne déclenchent aucun arrêt.
 
 ### Architecture
 

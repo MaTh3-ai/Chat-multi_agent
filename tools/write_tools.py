@@ -66,6 +66,7 @@ _PENDING_PROPOSALS: dict[
     str,
     dict[str, Any],
 ] = {}
+_RESOLVED_PROPOSAL_STATUSES: dict[str, str] = {}
 
 _PROPOSAL_LOCK = threading.RLock()
 
@@ -95,7 +96,11 @@ def _save_proposals_unlocked() -> None:
     temporary_path = PROPOSAL_STORE_PATH.with_name(
         f".{PROPOSAL_STORE_PATH.name}.{uuid.uuid4().hex}.tmp"
     )
-    payload = {"schema_version": 1, "proposals": list(_PENDING_PROPOSALS.values())}
+    payload = {
+        "schema_version": 2,
+        "proposals": list(_PENDING_PROPOSALS.values()),
+        "resolved_statuses": _RESOLVED_PROPOSAL_STATUSES,
+    }
     try:
         temporary_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -118,6 +123,11 @@ def _load_proposals_from_disk() -> None:
         if not isinstance(proposals, list):
             return
         with _PROPOSAL_LOCK:
+            resolved = payload.get("resolved_statuses", {})
+            if isinstance(resolved, dict):
+                _RESOLVED_PROPOSAL_STATUSES.update(
+                    {str(key): str(value) for key, value in resolved.items()}
+                )
             for proposal in proposals:
                 if isinstance(proposal, dict) and proposal.get("proposal_id"):
                     _PENDING_PROPOSALS[str(proposal["proposal_id"])] = proposal
@@ -976,6 +986,20 @@ def get_pending_proposals() -> list[dict[str, Any]]:
     )
 
 
+def get_proposal_statuses(proposal_ids: list[str]) -> dict[str, str]:
+    """Retourne les états courants sans exposer le contenu des propositions."""
+    with _PROPOSAL_LOCK:
+        statuses: dict[str, str] = {}
+        for proposal_id in proposal_ids:
+            if proposal_id in _PENDING_PROPOSALS:
+                statuses[proposal_id] = str(
+                    _PENDING_PROPOSALS[proposal_id].get("status", "unknown")
+                )
+            elif proposal_id in _RESOLVED_PROPOSAL_STATUSES:
+                statuses[proposal_id] = _RESOLVED_PROPOSAL_STATUSES[proposal_id]
+        return statuses
+
+
 def _reapply_proposal_on_current_content(
     *,
     proposal: dict[str, Any],
@@ -1338,6 +1362,121 @@ def reject_proposal(
         )
 
 
+def approve_pending_proposals(
+    proposal_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Applique atomiquement plusieurs propositions après prévalidation."""
+    with _PROPOSAL_LOCK:
+        return _approve_pending_proposals_unlocked(proposal_ids)
+
+
+def _approve_pending_proposals_unlocked(
+    proposal_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Implémentation transactionnelle ; verrou de propositions déjà acquis."""
+    pending = get_pending_proposals()
+    requested = set(proposal_ids) if proposal_ids is not None else None
+    selected = [
+        proposal for proposal in pending
+        if requested is None or str(proposal["proposal_id"]) in requested
+    ]
+    if not selected:
+        return []
+
+    transaction_id = uuid.uuid4().hex
+    virtual_contents: dict[Path, str] = {}
+    originals: dict[Path, str] = {}
+    originally_existed: dict[Path, bool] = {}
+    final_by_proposal: dict[str, str] = {}
+    try:
+        for proposal in selected:
+            path = _resolve_target_file(proposal["path"])
+            if path not in originals:
+                originally_existed[path] = path.exists()
+                originals[path] = _read_existing_content(path)
+                virtual_contents[path] = originals[path]
+            current_content = virtual_contents[path]
+            if _content_hash(current_content) == proposal["old_content_hash"]:
+                final_content = proposal["new_content"]
+            else:
+                final_content = _reapply_proposal_on_current_content(
+                    proposal=proposal,
+                    current_content=current_content,
+                )
+            validation = _validate_content_syntax(path=path, content=final_content)
+            if not validation.get("valid", True):
+                raise FileModificationError(
+                    f"{proposal['path']} : {validation.get('message', 'syntaxe invalide')}"
+                )
+            virtual_contents[path] = final_content
+            final_by_proposal[str(proposal["proposal_id"])] = final_content
+    except FileModificationError as error:
+        return [{
+            "proposal_id": str(proposal["proposal_id"]),
+            "path": proposal.get("path"),
+            "ok": False,
+            "error": f"Transaction annulée avant écriture : {error}",
+            "change_set_id": transaction_id,
+        } for proposal in selected]
+
+    backups: dict[Path, Path | None] = {}
+    temporary_paths: dict[Path, Path] = {}
+    committed: list[Path] = []
+    try:
+        for path, content in virtual_contents.items():
+            backups[path] = _create_backup(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{transaction_id}.tmp")
+            temporary.write_text(content, encoding="utf-8")
+            temporary_paths[path] = temporary
+        for path, temporary in temporary_paths.items():
+            temporary.replace(path)
+            committed.append(path)
+    except OSError as error:
+        for temporary in temporary_paths.values():
+            temporary.unlink(missing_ok=True)
+        rollback_errors: list[str] = []
+        for path in committed:
+            try:
+                original = originals[path]
+                if originally_existed[path]:
+                    path.write_text(original, encoding="utf-8")
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError as rollback_error:
+                rollback_errors.append(f"{path}: {rollback_error}")
+        detail = f"Transaction annulée pendant l'écriture : {error}"
+        if rollback_errors:
+            detail += " ; rollback incomplet : " + " | ".join(rollback_errors)
+        return [{
+            "proposal_id": str(proposal["proposal_id"]),
+            "path": proposal.get("path"),
+            "ok": False,
+            "error": detail,
+            "change_set_id": transaction_id,
+        } for proposal in selected]
+
+    applied_at = datetime.now(timezone.utc).isoformat()
+    with _PROPOSAL_LOCK:
+        for proposal in selected:
+            proposal_id = str(proposal["proposal_id"])
+            stored = _PENDING_PROPOSALS[proposal_id]
+            stored["status"] = "approved"
+            stored["applied_at"] = applied_at
+            stored["change_set_id"] = transaction_id
+            stored["applied_content_hash"] = _content_hash(
+                final_by_proposal[proposal_id]
+            )
+        _save_proposals_unlocked()
+    return [{
+        "proposal_id": str(proposal["proposal_id"]),
+        "path": proposal.get("path"),
+        "ok": True,
+        "result": deepcopy(_PENDING_PROPOSALS[str(proposal["proposal_id"])]),
+        "change_set_id": transaction_id,
+    } for proposal in selected]
+
+
 def clear_resolved_proposals() -> None:
     """
     Retire de la mémoire les propositions traitées.
@@ -1354,6 +1493,9 @@ def clear_resolved_proposals() -> None:
         ]
 
         for proposal_id in resolved_ids:
+            _RESOLVED_PROPOSAL_STATUSES[proposal_id] = str(
+                _PENDING_PROPOSALS[proposal_id].get("status", "unknown")
+            )
             _PENDING_PROPOSALS.pop(
                 proposal_id,
                 None,

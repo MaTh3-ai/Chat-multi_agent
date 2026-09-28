@@ -6,7 +6,9 @@ sont fournies par tools.write_tools et nécessitent une approbation humaine.
 Le mode d'accès réel du workspace est déterminé dynamiquement.
 """
 
+import json
 import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -89,6 +91,9 @@ MAX_LIST_RESULTS = 150
 
 # Les très gros fichiers ne sont pas chargés entièrement en mémoire.
 MAX_TEXT_FILE_SIZE_BYTES = 10 * 1024 * 1024
+MAX_COMMAND_TIMEOUT_SECONDS = 120
+MAX_COMMAND_OUTPUT_CHARACTERS = 20_000
+ALLOWED_COMMANDS = frozenset({"python", "python.exe", "pytest", "py", "ruff"})
 
 ALLOWED_TEXT_EXTENSIONS = {
     ".txt",
@@ -951,6 +956,56 @@ def rechercher_dans_fichiers(
         + "\n".join(results)
     )
 
+
+@tool
+def executer_commande_controlee(
+    commande: list[str],
+    dossier: str = ".",
+    timeout_secondes: int = 60,
+) -> str:
+    """Exécute une commande sans shell dans un dossier du workspace.
+
+    Seuls les outils de test et de qualité explicitement autorisés sont
+    disponibles. Les arguments sont transmis séparément : aucune expansion
+    shell, redirection ou chaîne arbitraire n'est acceptée.
+    """
+    if not isinstance(commande, list) or not commande or not all(
+        isinstance(part, str) and part.strip() for part in commande
+    ):
+        return json.dumps({"ok": False, "error": "commande doit être une liste non vide de chaînes."})
+    executable = Path(commande[0]).name.casefold()
+    if executable not in ALLOWED_COMMANDS:
+        return json.dumps({
+            "ok": False,
+            "error": f"Commande refusée. Autorisées : {', '.join(sorted(ALLOWED_COMMANDS))}.",
+        })
+    try:
+        working_directory = resolve_workspace_path(dossier)
+        if not working_directory.is_dir():
+            return json.dumps({"ok": False, "error": f"Dossier introuvable : {dossier}"})
+        timeout = max(1, min(int(timeout_secondes), MAX_COMMAND_TIMEOUT_SECONDS))
+        completed = subprocess.run(
+            commande,
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            shell=False,
+            check=False,
+        )
+    except (WorkspaceSecurityError, TypeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
+        return json.dumps({"ok": False, "error": f"{type(error).__name__}: {error}"}, ensure_ascii=False)
+    stdout = (completed.stdout or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
+    stderr = (completed.stderr or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
+    return json.dumps({
+        "ok": completed.returncode == 0,
+        "returncode": completed.returncode,
+        "cwd": get_relative_path(working_directory),
+        "stdout": stdout,
+        "stderr": stderr,
+    }, ensure_ascii=False)
+
+
 # -------------------------------------------------------------------
 # Liste des outils exportés
 # -------------------------------------------------------------------
@@ -962,4 +1017,5 @@ READ_ONLY_TOOLS = [
     explorer_workspace_cible,
     lire_fichier,
     rechercher_dans_fichiers,
+    executer_commande_controlee,
 ]

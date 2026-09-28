@@ -6,6 +6,15 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from core.multi_agent.coordination import (
+    Artifact,
+    Evidence,
+    STATE_RANK,
+    parse_worker_envelope,
+    repetition_ratio,
+    workspace_revision,
+)
+
 STATE_INTERVIEW = "INTERVIEW"
 STATE_DISCOVERY = "DISCOVERY"
 STATE_PLANIF = "PLANIF"
@@ -40,6 +49,12 @@ class TaskMetrics:
     retry_count: int = 0
     estimated_cost: float | None = None
     currency: str | None = None
+    target_output_tokens: int | None = None
+    target_output_exceeded: bool = False
+    repetition_ratio: float = 0.0
+    files_read: int = 0
+    artifacts_validated: int = 0
+    tokens_per_validated_artifact: float | None = None
 
 
 @dataclass
@@ -85,7 +100,11 @@ class Task:
     review_comment: str = ""
     status: str = STATUS_TODO
     dependencies: list[str] = field(default_factory=list)
+    dependency_state: str = "completed"
     deliverable: str | None = None
+    artifact: Artifact | None = None
+    input_revision: str = ""
+    output_revision: str = ""
     notes: str = ""
     error: str | None = None
     error_type: str | None = None
@@ -105,8 +124,16 @@ class Task:
         data.setdefault("capabilities", [])
         data.setdefault("max_retries", 1)
         data.setdefault("max_escalations", 1)
+        data.setdefault("dependency_state", "completed")
         data["metrics"] = TaskMetrics(**data.get("metrics", {}))
         data["attempts"] = [TaskAttempt(**item) for item in data.get("attempts", [])]
+        artifact = data.get("artifact")
+        if isinstance(artifact, dict):
+            artifact = dict(artifact)
+            artifact["evidence"] = [
+                Evidence(**item) for item in artifact.get("evidence", [])
+            ]
+            data["artifact"] = Artifact(**artifact)
         return cls(**data)
 
 
@@ -128,6 +155,7 @@ class TaskLedger:
     discovery_context: str = ""
     discovered_files: list[str] = field(default_factory=list)
     discovery_errors: list[str] = field(default_factory=list)
+    contradictions: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.state not in VALID_STATES:
@@ -149,10 +177,49 @@ class TaskLedger:
     def ready_tasks(self) -> list[Task]:
         if self.cancel_requested:
             return []
-        return [task for task in self.tasks if task.status == STATUS_TODO and all(self.is_done(dep) for dep in task.dependencies)]
+        ready: list[Task] = []
+        for task in self.tasks:
+            if task.status != STATUS_TODO:
+                continue
+            dependencies_ready = True
+            for dependency_id in task.dependencies:
+                dependency = self.get_task(dependency_id)
+                if dependency is None or dependency.status != STATUS_DONE:
+                    dependencies_ready = False
+                    break
+                if task.dependency_state != "completed":
+                    state = dependency.artifact.state if dependency.artifact else "observed"
+                    if STATE_RANK.get(state, -1) < STATE_RANK.get(task.dependency_state, 0):
+                        dependencies_ready = False
+                        break
+            if dependencies_ready:
+                ready.append(task)
+        return ready
 
     def all_done(self) -> bool:
         return bool(self.tasks) and all(task.status == STATUS_DONE for task in self.tasks)
+
+    def sync_artifact_states(self) -> None:
+        """Réconcilie les artefacts proposés avec l'état réel des propositions."""
+        proposal_ids = [
+            proposal_id
+            for task in self.tasks if task.artifact
+            for proposal_id in task.artifact.proposal_ids
+        ]
+        if not proposal_ids:
+            return
+        from tools.write_tools import get_proposal_statuses
+
+        statuses = get_proposal_statuses(proposal_ids)
+        for task in self.tasks:
+            artifact = task.artifact
+            if not artifact or not artifact.proposal_ids:
+                continue
+            current = [statuses.get(item, "unknown") for item in artifact.proposal_ids]
+            if current and all(item == "approved" for item in current):
+                artifact.state = "applied"
+                task.output_revision = workspace_revision()
+                artifact.output_revision = task.output_revision
 
     def pending_count(self) -> int:
         return sum(task.status in {STATUS_TODO, STATUS_DOING, STATUS_FAILED, STATUS_BLOCKED, STATUS_REVIEW} for task in self.tasks)
@@ -203,12 +270,95 @@ class TaskLedger:
         task.retryable = False
         if metrics is not None:
             task.metrics = metrics
+        envelope = parse_worker_envelope(content)
+        successful_test = any(
+            item.kind == "test"
+            and ("ok=true" in item.detail.casefold() or "returncode=0" in item.detail.casefold())
+            for item in envelope.evidence
+        )
+        artifact_state = envelope.state
+        if successful_test and artifact_state not in {"proposed", "approved"}:
+            artifact_state = "tested"
+        task.artifact = Artifact(
+            id=f"{task.id}:{task.attempt_count}",
+            task_id=task.id,
+            kind="worker_result",
+            state=artifact_state,
+            summary=envelope.summary,
+            references=envelope.references,
+            evidence=envelope.evidence,
+            proposal_ids=envelope.proposal_ids,
+            input_revision=task.input_revision,
+            output_revision=task.output_revision,
+            tested=bool(envelope.tests) or successful_test
+            or STATE_RANK[artifact_state] >= STATE_RANK["tested"],
+            claims=envelope.claims,
+        )
+        self._detect_claim_contradictions(task)
+        task.metrics.repetition_ratio = repetition_ratio(content)
+        task.metrics.files_read = len({
+            item.reference for item in envelope.evidence if item.kind in {"file", "file_read"}
+        })
+        task.metrics.artifacts_validated = int(
+            STATE_RANK[artifact_state] >= STATE_RANK["tested"]
+        )
+        if task.metrics.artifacts_validated and task.metrics.total_tokens:
+            task.metrics.tokens_per_validated_artifact = (
+                task.metrics.total_tokens / task.metrics.artifacts_validated
+            )
         if task.attempts:
             task.attempts[-1].status = STATUS_DONE
             task.attempts[-1].completed_at = utc_now_iso()
             task.attempts[-1].latency_ms = task.metrics.latency_ms
         self.set_status(task_id, STATUS_DONE)
         self.refresh_blocked_tasks()
+
+    def _detect_claim_contradictions(self, current_task: Task) -> None:
+        """Signale les affirmations incompatibles sur une même révision."""
+        current = current_task.artifact
+        if not current or not current.claims:
+            return
+        for other_task in self.tasks:
+            other = other_task.artifact
+            if (
+                other_task.id == current_task.id
+                or not other
+                or not other.claims
+                or other.output_revision != current.output_revision
+            ):
+                continue
+            previous = {
+                (
+                    item.get("subject", "").casefold(),
+                    item.get("predicate", "").casefold(),
+                ): item.get("value", "")
+                for item in other.claims
+            }
+            for claim in current.claims:
+                key = (
+                    claim.get("subject", "").casefold(),
+                    claim.get("predicate", "").casefold(),
+                )
+                old_value = previous.get(key)
+                new_value = claim.get("value", "")
+                if old_value is None or old_value.casefold() == new_value.casefold():
+                    continue
+                if any(
+                    item.get("claim_key") == list(key)
+                    and not item.get("resolved", False)
+                    for item in self.contradictions
+                ):
+                    continue
+                self.contradictions.append({
+                    "id": f"C{len(self.contradictions) + 1:03d}",
+                    "task_ids": [other_task.id, current_task.id],
+                    "claim_key": list(key),
+                    "message": (
+                        f"{claim.get('subject')} / {claim.get('predicate')} : "
+                        f"{old_value!r} contre {new_value!r} sur la même révision."
+                    ),
+                    "resolved": False,
+                })
 
     def set_error(self, task_id: str, error: str, error_type: str | None = None, retryable: bool = False, metrics: TaskMetrics | None = None) -> None:
         task = self.require_task(task_id)
@@ -334,7 +484,13 @@ class TaskLedger:
         known = [task.metrics for task in self.tasks]
         def total(field_name: str) -> int:
             return sum(getattr(item, field_name) or 0 for item in known)
-        return {"task_count": len(self.tasks), "done": len(self.tasks_with_status(STATUS_DONE)), "failed": len(self.tasks_with_status(STATUS_FAILED)), "blocked": len(self.tasks_with_status(STATUS_BLOCKED)), "cancelled": len(self.tasks_with_status(STATUS_CANCELLED)), "model_calls": total("model_calls"), "retries": total("retry_count"), "input_tokens": total("input_tokens"), "output_tokens": total("output_tokens"), "total_tokens": total("total_tokens")}
+        artifacts = sum(item.artifacts_validated for item in known)
+        total_tokens = total("total_tokens")
+        repetition = (
+            sum(item.repetition_ratio for item in known) / len(known)
+            if known else 0.0
+        )
+        return {"task_count": len(self.tasks), "done": len(self.tasks_with_status(STATUS_DONE)), "failed": len(self.tasks_with_status(STATUS_FAILED)), "blocked": len(self.tasks_with_status(STATUS_BLOCKED)), "cancelled": len(self.tasks_with_status(STATUS_CANCELLED)), "model_calls": total("model_calls"), "retries": total("retry_count"), "input_tokens": total("input_tokens"), "output_tokens": total("output_tokens"), "total_tokens": total_tokens, "files_read": total("files_read"), "artifacts_validated": artifacts, "tokens_per_validated_artifact": (total_tokens / artifacts if artifacts else None), "average_repetition_ratio": repetition}
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

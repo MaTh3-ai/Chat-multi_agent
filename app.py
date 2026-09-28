@@ -53,6 +53,7 @@ from llm_engine import (
 from tools.write_tools import (
     FileModificationError,
     approve_proposal,
+    approve_pending_proposals,
     clear_resolved_proposals,
     get_pending_proposals,
     reject_proposal,
@@ -135,8 +136,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "l'approbation de l'utilisateur dans l'interface. "
     "Ne prétends jamais qu'un fichier a été modifié tant que "
     "l'utilisateur n'a pas approuvé la proposition. "
-    "Tu ne peux pas appliquer directement une proposition, supprimer "
-    "un fichier entier ou exécuter une commande système."
+    "Tu ne peux pas appliquer directement une proposition ni supprimer "
+    "un fichier entier. Pour vérifier un changement, utilise uniquement "
+    "executer_commande_controlee avec une commande autorisée, sans shell."
 )
 
 
@@ -655,6 +657,39 @@ def display_pending_proposals():
         "cliqué sur Approuver."
     )
 
+    auto_approve = st.session_state.get("agent_auto_approve", False)
+    action_column, status_column = st.columns(2)
+    with action_column:
+        approve_all_clicked = st.button(
+            "✅ Valider toutes les propositions",
+            key="approve_all_pending",
+            type="primary",
+            use_container_width=True,
+            disabled=auto_approve,
+        )
+    with status_column:
+        st.caption(
+            "Validation automatique active."
+            if auto_approve
+            else "Validation manuelle active."
+        )
+
+    if approve_all_clicked:
+        results = approve_pending_proposals()
+        applied = [item for item in results if item["ok"]]
+        failed = [item for item in results if not item["ok"]]
+        for item in applied:
+            add_system_notification(
+                f"✅ Proposition appliquée : `{item['path']}`."
+            )
+        for item in failed:
+            st.error(
+                f"Impossible d'appliquer `{item['path']}` : {item['error']}"
+            )
+        clear_resolved_proposals()
+        if applied:
+            st.rerun()
+
     for proposal in pending_proposals:
         proposal_id = proposal[
             "proposal_id"
@@ -736,7 +771,7 @@ def display_pending_proposals():
                     key=f"approve_{proposal_id}",
                     type="primary",
                     use_container_width=True,
-                    disabled=not syntax_valid,
+                    disabled=not syntax_valid or auto_approve,
                 )
 
             with reject_column:
@@ -811,6 +846,21 @@ def display_pending_proposals():
                     st.exception(error)
 
     st.divider()
+
+
+def _auto_approve_agent_proposals() -> None:
+    """Applique les propositions valides créées par le tour courant."""
+    results = approve_pending_proposals()
+    for item in results:
+        if item["ok"]:
+            add_system_notification(
+                f"✅ Validation automatique : `{item['path']}` a été appliquée."
+            )
+        else:
+            st.error(
+                f"Validation automatique impossible pour `{item['path']}` : "
+                f"{item['error']}"
+            )
 
 
 # -------------------------------------------------------------------
@@ -1047,6 +1097,16 @@ with st.sidebar:
     )
 
     st.session_state.app_mode = app_mode
+
+    st.session_state.agent_auto_approve = st.toggle(
+        "Validation automatique des propositions",
+        value=st.session_state.get("agent_auto_approve", False),
+        disabled=is_locked,
+        help=(
+            "Applique automatiquement les propositions valides créées pendant "
+            "un tour. Les conflits restent bloqués individuellement."
+        ),
+    )
 
     st.divider()
 
@@ -1291,7 +1351,14 @@ with st.sidebar:
 
     st.subheader("📝 Modifications en attente")
 
-    display_pending_proposals()
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every="2s")
+        def _pending_proposals_fragment():
+            display_pending_proposals()
+
+        _pending_proposals_fragment()
+    else:
+        display_pending_proposals()
 
     st.divider()
 
@@ -1717,6 +1784,10 @@ if prompt or uploaded_files:
                     "proposition en attente n'a été trouvée. Consulte les "
                     "résultats techniques des outils."
                 )
+            if pending_proposals and st.session_state.get("agent_auto_approve", False):
+                _auto_approve_agent_proposals()
+                clear_resolved_proposals()
+                st.rerun()
             if pending_proposals:
                 st.rerun()
 

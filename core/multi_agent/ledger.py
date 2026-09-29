@@ -199,6 +199,82 @@ class TaskLedger:
     def all_done(self) -> bool:
         return bool(self.tasks) and all(task.status == STATUS_DONE for task in self.tasks)
 
+    def stalled_tasks(self) -> list[tuple[Task, str]]:
+        """Taches TODO qui ne peuvent plus devenir executables sans action humaine.
+
+        Deux causes : une barriere d'etat qu'un artefact dependant n'atteint
+        pas (proposition non appliquee), ou une dependance definitivement
+        non terminee. Sans ce diagnostic, ces taches bloquent indefiniment la
+        synthese alors qu'aucune progression automatique n'est possible.
+        """
+        ready_ids = {task.id for task in self.ready_tasks()}
+        stalled: list[tuple[Task, str]] = []
+        for task in self.tasks:
+            if task.status != STATUS_TODO or task.id in ready_ids:
+                continue
+            reasons: list[str] = []
+            for dependency_id in task.dependencies:
+                dependency = self.get_task(dependency_id)
+                if dependency is None:
+                    reasons.append(f"dependance introuvable : {dependency_id}")
+                    continue
+                if dependency.status != STATUS_DONE:
+                    reasons.append(
+                        f"« {dependency.title} » est en statut {dependency.status}"
+                    )
+                    continue
+                if task.dependency_state != "completed":
+                    state = dependency.artifact.state if dependency.artifact else "observed"
+                    if STATE_RANK.get(state, -1) < STATE_RANK.get(task.dependency_state, 0):
+                        reasons.append(
+                            f"« {dependency.title} » est a l'etat '{state}' alors que "
+                            f"'{task.dependency_state}' est requis"
+                        )
+            if reasons:
+                stalled.append((task, " ; ".join(reasons)))
+        return stalled
+
+    def barrier_blocked_tasks(self) -> list[tuple[Task, str]]:
+        """Taches bloquees uniquement par une barriere d'etat d'artefact."""
+        blocked: list[tuple[Task, str]] = []
+        for task, reason in self.stalled_tasks():
+            if task.dependency_state == "completed":
+                continue
+            if all(
+                (dependency := self.get_task(dependency_id)) is not None
+                and dependency.status == STATUS_DONE
+                for dependency_id in task.dependencies
+            ):
+                blocked.append((task, reason))
+        return blocked
+
+    def release_barriers(self, task_ids: list[str] | None = None) -> list[str]:
+        """Ramene la barriere a 'completed' pour reprendre l'execution.
+
+        Utilise quand un artefact dependant reste a l'etat propose : la
+        decision d'avancer malgre tout appartient a l'humain, et elle est
+        tracee comme une decision du chantier.
+        """
+        targets = (
+            [task for task, _ in self.barrier_blocked_tasks()]
+            if task_ids is None
+            else [task for task in self.tasks if task.id in set(task_ids)]
+        )
+        released: list[str] = []
+        for task in targets:
+            if task.dependency_state == "completed":
+                continue
+            previous = task.dependency_state
+            task.dependency_state = "completed"
+            task.updated_at = utc_now_iso()
+            released.append(task.id)
+            self.decisions.append(
+                f"Barriere levee pour « {task.title} » : '{previous}' -> 'completed'."
+            )
+        if released:
+            self.updated_at = utc_now_iso()
+        return released
+
     def sync_artifact_states(self) -> None:
         """Réconcilie les artefacts proposés avec l'état réel des propositions."""
         proposal_ids = [

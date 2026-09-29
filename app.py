@@ -59,6 +59,7 @@ from tools.write_tools import (
     reject_proposal,
 )
 from core.prompt_rewriter import rewrite_user_prompt
+from core.command_journal import render_command_journal
 from core.multi_agent.ui import render_multi_agent
 
 
@@ -1359,6 +1360,11 @@ with st.sidebar:
         _pending_proposals_fragment()
     else:
         display_pending_proposals()
+
+    st.divider()
+
+    st.subheader("🖥️ Commandes exécutées")
+    render_command_journal(key_prefix="chat")
 
     st.divider()
 

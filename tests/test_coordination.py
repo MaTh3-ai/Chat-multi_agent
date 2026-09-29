@@ -8,8 +8,15 @@ from core.multi_agent.coordination import (
     repetition_ratio,
     workspace_revision,
 )
-from core.multi_agent.ledger import STATUS_DONE, Task, TaskLedger
-from tools.custom_tools import WORKSPACE_ROOT
+from core.command_journal import clear_command_journal, get_command_journal
+from core.multi_agent.ledger import (
+    STATUS_DOING,
+    STATUS_DONE,
+    STATUS_TODO,
+    Task,
+    TaskLedger,
+)
+from tools.custom_tools import WORKSPACE_ROOT, executer_commande_controlee
 from tools.write_tools import (
     _register_proposal,
     approve_pending_proposals,
@@ -182,6 +189,121 @@ class CoordinationTest(unittest.TestCase):
         self.assertEqual(restored_task.artifact.state, "tested")
         self.assertEqual(restored_task.artifact.evidence[0].reference, "a.py")
         self.assertEqual(restored_task.output_revision, "after")
+
+
+class BarrierDeadlockTest(unittest.TestCase):
+    """Reproduit le blocage observe : 3 taches en attente, aucune synthese possible."""
+
+    def _ledger_with_unapplied_proposal(self) -> TaskLedger:
+        dependency = Task("T01", "Implementer le helper", "x", "fast")
+        ledger = TaskLedger(tasks=[dependency])
+        ledger.begin_task("T01")
+        ledger.set_deliverable("T01", json.dumps({
+            "state": "proposed",
+            "summary": "Patch propose mais non applique.",
+            "references": [],
+            "evidence": [],
+            "proposal_ids": [],
+            "tests": [],
+            "blockers": [],
+        }))
+        for task_id, title in (
+            ("T02", "Cablage des composants"),
+            ("T03", "Rebuild et controle du bundle"),
+            ("T04", "Verification independante"),
+        ):
+            ledger.add_task(Task(
+                task_id, title, "x", "fast",
+                dependencies=["T01"], dependency_state="applied",
+            ))
+        return ledger
+
+    def test_barrier_blocked_tasks_are_reported_with_reason(self):
+        ledger = self._ledger_with_unapplied_proposal()
+        self.assertEqual(ledger.ready_tasks(), [])
+
+        stalled = ledger.stalled_tasks()
+        self.assertEqual(len(stalled), 3)
+        reason = dict((task.id, text) for task, text in stalled)["T02"]
+        self.assertIn("proposed", reason)
+        self.assertIn("applied", reason)
+        self.assertEqual(len(ledger.barrier_blocked_tasks()), 3)
+
+    def test_stalled_tasks_no_longer_block_the_synthesis_gate(self):
+        ledger = self._ledger_with_unapplied_proposal()
+        stalled_ids = {task.id for task, _ in ledger.stalled_tasks()}
+        # Reproduit la condition exacte de l'interface de revue.
+        actionable = [
+            task for task in ledger.tasks
+            if task.status == STATUS_DOING
+            or (task.status == STATUS_TODO and task.id not in stalled_ids)
+        ]
+        self.assertEqual(actionable, [], "la synthese doit redevenir accessible")
+
+    def test_releasing_barriers_makes_tasks_ready_and_is_traced(self):
+        ledger = self._ledger_with_unapplied_proposal()
+        released = ledger.release_barriers()
+        self.assertEqual(len(released), 3)
+        self.assertEqual(len(ledger.ready_tasks()), 3)
+        self.assertEqual(ledger.stalled_tasks(), [])
+        self.assertTrue(any("Barriere levee" in item for item in ledger.decisions))
+
+    def test_failed_dependency_also_stops_blocking_the_synthesis(self):
+        dependency = Task("T01", "Analyser", "x", "fast")
+        ledger = TaskLedger(tasks=[dependency])
+        ledger.begin_task("T01")
+        ledger.set_error("T01", "echec definitif", error_type="fatal")
+        ledger.add_task(Task("T02", "Suite", "x", "fast", dependencies=["T01"]))
+
+        stalled = ledger.stalled_tasks()
+        self.assertEqual([task.id for task, _ in stalled], ["T02"])
+        # Une dependance en echec n'est pas une barriere d'artefact.
+        self.assertEqual(ledger.barrier_blocked_tasks(), [])
+
+
+class CommandJournalTest(unittest.TestCase):
+    def setUp(self):
+        clear_command_journal()
+
+    def tearDown(self):
+        clear_command_journal()
+
+    def test_successful_command_is_recorded_for_the_interface(self):
+        raw = executer_commande_controlee.invoke({
+            "commande": ["python", "-c", "print('trace visible')"],
+            "dossier": ".",
+        })
+        payload = json.loads(raw)
+        self.assertTrue(payload["ok"])
+
+        entries = get_command_journal()
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0]["ok"])
+        self.assertIn("trace visible", entries[0]["stdout"])
+        self.assertIn("python", entries[0]["display"])
+
+    def test_refused_command_is_recorded_and_not_marked_successful(self):
+        raw = executer_commande_controlee.invoke({
+            "commande": ["rm", "-rf", "/"],
+            "dossier": ".",
+        })
+        self.assertFalse(json.loads(raw)["ok"])
+
+        entries = get_command_journal()
+        self.assertEqual(len(entries), 1)
+        self.assertFalse(entries[0]["ok"])
+        self.assertIn("refus", entries[0]["error"].casefold())
+        self.assertIsNone(entries[0]["returncode"])
+
+    def test_failing_command_keeps_return_code_and_streams(self):
+        executer_commande_controlee.invoke({
+            "commande": ["python", "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"],
+            "dossier": ".",
+        })
+        entry = get_command_journal()[0]
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["returncode"], 3)
+        self.assertIn("boom", entry["stderr"])
 
 
 if __name__ == "__main__":

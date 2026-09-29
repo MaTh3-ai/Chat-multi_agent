@@ -12,6 +12,7 @@ import time
 import streamlit as st
 
 from core.models import resolve_tier_to_model_alias
+from core.command_journal import render_command_journal
 from core.prompt_rewriter import rewrite_user_prompt
 from core.multi_agent.background import (
     STATUS_CANCELLED as JOB_STATUS_CANCELLED,
@@ -623,6 +624,7 @@ def render_multi_agent() -> None:
     else:
         st.error(f"Etat multi-agent inconnu : {state!r}")
 
+    render_command_journal(key_prefix="ma")
     _render_events(chief)
 
 
@@ -844,10 +846,8 @@ def _phase_review(chief) -> None:
 
     chief.ledger.sync_artifact_states()
     resumed = chief.ledger.ready_tasks()
-    waiting = [
-        task for task in chief.ledger.tasks
-        if task.status == STATUS_TODO and task not in resumed
-    ]
+    stalled = chief.ledger.stalled_tasks()
+    barrier_blocked = chief.ledger.barrier_blocked_tasks()
     if resumed:
         if st.button(
             f"Reprendre les tâches débloquées ({len(resumed)})",
@@ -859,11 +859,35 @@ def _phase_review(chief) -> None:
                 return {"state": STATE_REVIEW}
 
             _start_background_job(chief, "reprise après synchronisation", _run_resume)
-    elif waiting:
-        st.info(
-            f"{len(waiting)} tâche(s) attendent encore l'état appliqué/testé "
-            "d'un artefact dépendant."
-        )
+
+    if stalled:
+        with st.expander(
+            f"{len(stalled)} tâche(s) en attente : pourquoi ?", expanded=True
+        ):
+            for task, reason in stalled:
+                st.markdown(f"**{task.title}** — {reason}")
+        if barrier_blocked:
+            st.info(
+                "Une barrière d'état retient ces tâches : l'artefact dont elles "
+                "dépendent est proposé mais pas encore appliqué. Valide les "
+                "propositions correspondantes, ou lève la barrière pour avancer "
+                "sans attendre."
+            )
+            if st.button(
+                f"Lever les barrières et reprendre ({len(barrier_blocked)})",
+                key="ma_release_barriers",
+            ):
+                released = chief.ledger.release_barriers()
+
+                def _run_released(job):
+                    job.emit(
+                        "state",
+                        f"{len(released)} barriere(s) levee(s) : reprise de l'execution.",
+                    )
+                    chief.execute(cancel_event=job.cancel_event)
+                    return {"state": STATE_REVIEW}
+
+                _start_background_job(chief, "reprise apres levee de barriere", _run_released)
 
     retryable = [
         task for task in chief.ledger.tasks
@@ -933,17 +957,21 @@ def _phase_review(chief) -> None:
                 st.markdown(f"**{task.title}** — verdict : `{task.review_verdict}`")
                 st.text(task.review_comment)
 
-    # La synthèse est ouverte dès qu'aucune tâche n'est plus exécutable, même
-    # si certaines ont échoué : un échec définitif ne doit plus condamner le
-    # chantier. La synthèse signale alors explicitement ce qui manque.
+    # La synthèse est ouverte dès qu'aucune tâche n'est plus exécutable
+    # automatiquement. Une tâche TODO qui n'est ni prête ni en cours est
+    # bloquée par une barrière ou une dépendance en échec : elle ne progressera
+    # pas sans action humaine et ne doit donc plus condamner le chantier.
+    stalled_ids = {task.id for task, _ in stalled}
     actionable = [
         task for task in chief.ledger.tasks
-        if task.status in {STATUS_TODO, STATUS_DOING}
+        if task.status == STATUS_DOING
+        or (task.status == STATUS_TODO and task.id not in stalled_ids)
     ]
     if chief.ledger.tasks and not actionable:
         incidents = [
             task for task in chief.ledger.tasks
             if task.status in {STATUS_FAILED, STATUS_BLOCKED, STATUS_CANCELLED, STATUS_REVIEW}
+            or task.id in stalled_ids
         ]
         if incidents:
             st.info(

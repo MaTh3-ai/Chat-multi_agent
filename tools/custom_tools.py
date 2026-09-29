@@ -9,10 +9,13 @@ Le mode d'accès réel du workspace est déterminé dynamiquement.
 import json
 import os
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
 from langchain_core.tools import tool
+
+from core.command_journal import record_command
 
 
 # -------------------------------------------------------------------
@@ -972,17 +975,21 @@ def executer_commande_controlee(
     if not isinstance(commande, list) or not commande or not all(
         isinstance(part, str) and part.strip() for part in commande
     ):
-        return json.dumps({"ok": False, "error": "commande doit être une liste non vide de chaînes."})
+        message = "commande doit être une liste non vide de chaînes."
+        record_command(command=commande if isinstance(commande, list) else str(commande), error=message)
+        return json.dumps({"ok": False, "error": message})
     executable = Path(commande[0]).name.casefold()
     if executable not in ALLOWED_COMMANDS:
-        return json.dumps({
-            "ok": False,
-            "error": f"Commande refusée. Autorisées : {', '.join(sorted(ALLOWED_COMMANDS))}.",
-        })
+        message = f"Commande refusée. Autorisées : {', '.join(sorted(ALLOWED_COMMANDS))}."
+        record_command(command=commande, cwd=dossier, error=message)
+        return json.dumps({"ok": False, "error": message})
+    started = time.monotonic()
     try:
         working_directory = resolve_workspace_path(dossier)
         if not working_directory.is_dir():
-            return json.dumps({"ok": False, "error": f"Dossier introuvable : {dossier}"})
+            message = f"Dossier introuvable : {dossier}"
+            record_command(command=commande, cwd=dossier, error=message)
+            return json.dumps({"ok": False, "error": message})
         timeout = max(1, min(int(timeout_secondes), MAX_COMMAND_TIMEOUT_SECONDS))
         completed = subprocess.run(
             commande,
@@ -994,9 +1001,24 @@ def executer_commande_controlee(
             check=False,
         )
     except (WorkspaceSecurityError, TypeError, ValueError, OSError, subprocess.TimeoutExpired) as error:
-        return json.dumps({"ok": False, "error": f"{type(error).__name__}: {error}"}, ensure_ascii=False)
+        message = f"{type(error).__name__}: {error}"
+        record_command(
+            command=commande,
+            cwd=dossier,
+            error=message,
+            duration_seconds=time.monotonic() - started,
+        )
+        return json.dumps({"ok": False, "error": message}, ensure_ascii=False)
     stdout = (completed.stdout or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
     stderr = (completed.stderr or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
+    record_command(
+        command=commande,
+        cwd=get_relative_path(working_directory),
+        returncode=completed.returncode,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=time.monotonic() - started,
+    )
     return json.dumps({
         "ok": completed.returncode == 0,
         "returncode": completed.returncode,

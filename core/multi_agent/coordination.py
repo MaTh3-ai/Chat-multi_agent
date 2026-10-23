@@ -20,7 +20,7 @@ ARTIFACT_STATES = (
 )
 STATE_RANK = {state: index for index, state in enumerate(ARTIFACT_STATES)}
 DEFAULT_CONTEXT_TARGET_CHARACTERS = 12_000
-MAX_DISCOVERY_CONTEXT_CHARACTERS = 6_000
+MAX_DISCOVERY_CONTEXT_CHARACTERS = 1_200
 MAX_DEPENDENCY_CONTEXT_CHARACTERS = 2_000
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
@@ -165,10 +165,16 @@ def compile_context(ledger: Any, task: Any, discovery_context: str = "") -> str:
     """Construit un contexte cible sans recopier les rapports complets."""
     parts: list[str] = []
     if discovery_context:
-        parts.append(
-            "DÉCOUVERTE PARTIELLE NON AUTORITATIVE\n"
-            + discovery_context[:MAX_DISCOVERY_CONTEXT_CHARACTERS]
-        )
+        # Le Chef a déjà reçu les extraits complets pendant la planification.
+        # Les workers reçoivent seulement le manifeste de chemins et peuvent
+        # ouvrir eux-mêmes les fichiers utiles avec leurs outils de lecture.
+        discovered_files = getattr(ledger, "discovered_files", []) or []
+        manifest = ", ".join(str(path) for path in discovered_files[:8])
+        if manifest:
+            parts.append(
+                "FICHIERS DU PROJET REPÉRÉS (à ouvrir uniquement si utiles)\n"
+                + manifest[:MAX_DISCOVERY_CONTEXT_CHARACTERS]
+            )
     dependencies = []
     for dependency_id in getattr(task, "dependencies", []):
         dependency = ledger.get_task(dependency_id)

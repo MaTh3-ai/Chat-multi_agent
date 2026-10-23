@@ -13,7 +13,6 @@ import streamlit as st
 
 from core.models import resolve_tier_to_model_alias
 from core.command_journal import render_command_journal
-from core.prompt_rewriter import rewrite_user_prompt
 from core.multi_agent.background import (
     STATUS_CANCELLED as JOB_STATUS_CANCELLED,
     STATUS_ERROR as JOB_STATUS_ERROR,
@@ -718,18 +717,23 @@ def _phase_interview(chief) -> None:
     message = st.chat_input("Decris ou precise ton besoin...", key="ma_interview_input")
     if message:
         text = message
-        rewrite_enabled = bool(st.session_state.get("prompt_rewrite_enabled", True))
-
         def _run_interview(job):
-            # La reformulation est elle aussi un appel LLM : elle fait partie
-            # du travail déporté, sinon elle rebloque le script.
+            # La demande initiale sert directement à la recherche ciblée :
+            # aucune reformulation LLM supplémentaire n'est nécessaire.
             prompt = text
-            if rewrite_enabled:
-                job.emit("state", "Reformulation de la demande...")
-                rewrite = rewrite_user_prompt(prompt, mode="agent")
-                if rewrite.ok and rewrite.text:
-                    prompt = rewrite.text
-            job.emit("state", "Le Chef analyse la demande...")
+            if not chief.discovery_report:
+                terms = _extract_discovery_terms([("user", prompt)])
+                job.emit("state", "Lecture ciblée des consignes et fichiers du projet...")
+                try:
+                    chief.discover(terms=terms or None)
+                except Exception as error:
+                    # L'entretien reste possible si le workspace est vide ou
+                    # si la lecture de contexte échoue.
+                    job.emit(
+                        "info",
+                        f"Découverte ignorée pour l'entretien : {type(error).__name__}.",
+                    )
+            job.emit("state", "Le Chef analyse la demande et le contexte du projet...")
             chief.interview(prompt)
             return {}
 
@@ -747,7 +751,11 @@ def _phase_interview(chief) -> None:
                 "state",
                 f"Termes de decouverte retenus : {terms or 'fallback automatique'}.",
             )
-            report = chief.discover(terms=terms if terms else None)
+            report = (
+                chief.discovery_report
+                if chief.discovery_report and chief.discovery_report.successful
+                else chief.discover(terms=terms if terms else None)
+            )
             job.emit(
                 "state",
                 f"{len(report.explored_files)} fichier(s) identifie(s), "

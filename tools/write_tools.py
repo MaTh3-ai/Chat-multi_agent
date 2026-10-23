@@ -1504,6 +1504,140 @@ def clear_resolved_proposals() -> None:
 
 
 # -------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Ecriture directe réservée aux workers du mode multi-agent
+# -------------------------------------------------------------------
+
+def _apply_direct_change(tool_object: Any, arguments: dict[str, Any]) -> str:
+    """Valide, sauvegarde et applique une écriture sans étape d'approbation UI."""
+    raw_result = tool_object.invoke(arguments)
+    try:
+        prepared = json.loads(raw_result)
+    except (json.JSONDecodeError, TypeError):
+        return str(raw_result)
+
+    proposal_id = prepared.get("proposal_id")
+    if not prepared.get("ok") or not prepared.get("created") or not proposal_id:
+        return str(raw_result)
+
+    try:
+        applied = approve_proposal(str(proposal_id))
+    except Exception as error:
+        # Une écriture refusée ne doit pas rester comme proposition en attente :
+        # le mode multi-agent n'utilise plus ce circuit d'approbation.
+        try:
+            reject_proposal(str(proposal_id))
+        except Exception:
+            pass
+        return json.dumps({
+            "ok": False,
+            "applied": False,
+            "path": prepared.get("path"),
+            "error": f"{type(error).__name__}: {error}",
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "ok": True,
+        "created": True,
+        "applied": True,
+        "proposal_id": str(proposal_id),
+        "path": applied.get("path"),
+        "operation": applied.get("operation"),
+        "backup_path": applied.get("backup_path"),
+        "changed": True,
+        "message": "Modification écrite et sauvegardée.",
+    }, ensure_ascii=False)
+
+
+@tool
+def ecrire_fichier_directement(
+    chemin: str,
+    nouveau_contenu: str,
+    justification: str,
+    autoriser_reduction_massive: bool = False,
+) -> str:
+    """Crée ou remplace directement un fichier texte du workspace.
+
+    La modification est appliquée immédiatement après validation syntaxique
+    et sauvegarde de l'ancienne version. Préfère les outils de patch ciblé
+    pour limiter la sortie générée et éviter de réécrire de gros fichiers.
+    """
+    return _apply_direct_change(
+        proposer_modification_fichier,
+        {
+            "chemin": chemin,
+            "nouveau_contenu": nouveau_contenu,
+            "justification": justification,
+            "autoriser_reduction_massive": autoriser_reduction_massive,
+        },
+    )
+
+
+@tool
+def remplacer_bloc_directement(
+    chemin: str,
+    ancien_texte: str,
+    nouveau_texte: str,
+    justification: str,
+) -> str:
+    """Remplace une occurrence exacte dans un fichier du workspace et applique le changement."""
+    return _apply_direct_change(
+        proposer_remplacement_cible,
+        {
+            "chemin": chemin,
+            "ancien_texte": ancien_texte,
+            "nouveau_texte": nouveau_texte,
+            "justification": justification,
+        },
+    )
+
+
+@tool
+def inserer_bloc_directement(
+    chemin: str,
+    ancre: str,
+    contenu_a_inserer: str,
+    justification: str,
+    position: str = "apres",
+) -> str:
+    """Insère un bloc autour d'une ancre unique et applique le changement."""
+    return _apply_direct_change(
+        proposer_insertion_ciblee,
+        {
+            "chemin": chemin,
+            "ancre": ancre,
+            "contenu_a_inserer": contenu_a_inserer,
+            "justification": justification,
+            "position": position,
+        },
+    )
+
+
+@tool
+def supprimer_bloc_directement(
+    chemin: str,
+    texte_a_supprimer: str,
+    justification: str,
+) -> str:
+    """Supprime une occurrence exacte d'un bloc et applique le changement."""
+    return _apply_direct_change(
+        proposer_suppression_ciblee,
+        {
+            "chemin": chemin,
+            "texte_a_supprimer": texte_a_supprimer,
+            "justification": justification,
+        },
+    )
+
+
+DIRECT_WRITE_TOOLS = [
+    ecrire_fichier_directement,
+    remplacer_bloc_directement,
+    inserer_bloc_directement,
+    supprimer_bloc_directement,
+]
+
+
 # Outils exportés vers l'agent
 # -------------------------------------------------------------------
 

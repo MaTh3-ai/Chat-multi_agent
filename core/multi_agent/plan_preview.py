@@ -244,7 +244,7 @@ def _render_task_editor(ledger: TaskLedger, discovery_context: str) -> dict[str,
 
             new_capabilities = st.multiselect(
                 "Capacités déclarées",
-                options=["auto", "read", "propose_write", "generate"],
+                options=["auto", "read", "write", "execute", "propose_write", "generate"],
                 default=list(getattr(task, "capabilities", []) or ["auto"]),
                 key=f"{key_prefix}_capabilities",
                 help="Mode d'outil autorisé : lecture, proposition d'écriture ou génération.",
@@ -258,22 +258,16 @@ def _render_task_editor(ledger: TaskLedger, discovery_context: str) -> dict[str,
                     value=int(getattr(task, "max_retries", 1)),
                     key=f"{key_prefix}_max_retries",
                 )
-            with budget_col2:
-                new_max_escalations = st.number_input(
-                    "Escalades maximum",
-                    min_value=0,
-                    max_value=1,
-                    value=int(getattr(task, "max_escalations", 1)),
-                    key=f"{key_prefix}_max_escalations",
-                )
-            
+            # Legacy field retained on load; there is no second retry loop.
+            new_max_escalations = task.max_escalations
+
             # Description enrichie (extraire les parties)
             description_parts = task.description.split("\n\nSortie attendue : ")
             base_description = description_parts[0]
             
             # Extraire expected_output et criteria si présents
-            expected_output = ""
-            criteria = []
+            expected_output = task.expected_output
+            criteria = list(task.acceptance_criteria)
             if len(description_parts) > 1:
                 remaining = description_parts[1]
                 output_parts = remaining.split("\n\nCritères d'acceptation :\n")
@@ -453,7 +447,7 @@ def _apply_edits(ledger: TaskLedger, edited_tasks: dict[str, dict[str, Any]]) ->
             continue
         capabilities = list(edits.get("capabilities", task.capabilities or ["auto"]))
         if not capabilities or not set(capabilities).issubset(
-            {"auto", "read", "propose_write", "generate"}
+            {"auto", "read", "write", "execute", "propose_write", "generate"}
         ):
             raise ValueError(f"{task.id} contient une capacité inconnue.")
         max_retries = int(edits.get("max_retries", task.max_retries))
@@ -491,12 +485,13 @@ def _apply_edits(ledger: TaskLedger, edited_tasks: dict[str, dict[str, Any]]) ->
             raise ValueError(f"{task.id} contient un état de dépendance inconnu.")
         task.dependency_state = dependency_state
         
-        task.description = _enrich_description(
-            edits["description"],
-            edits.get("expected_output", ""),
-            edits.get("criteria", []),
-            edits.get("requires_review", task.requires_review),
-        )
+        task.description = edits["description"].strip()
+        task.expected_output = str(edits.get("expected_output", task.expected_output)).strip()
+        task.acceptance_criteria = list(edits.get("criteria", task.acceptance_criteria))
+        # A changed instruction is a new execution, not a resume of old work.
+        from uuid import uuid4
+        task.execution_id = uuid4().hex
+
     
     return ledger
 

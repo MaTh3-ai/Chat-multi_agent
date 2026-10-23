@@ -7,8 +7,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from functools import lru_cache
 
-from tools.custom_tools import WORKSPACE_ROOT
+from tools.custom_tools import WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES
 
 ARTIFACT_STATES = (
     "observed",
@@ -31,6 +32,14 @@ class Evidence:
     reference: str
     detail: str = ""
     content_hash: str | None = None
+    source: str = "model"
+    ok: bool | None = None
+    applied: bool = False
+    sequence: int = -1
+    category: str = ""
+    checked_files: dict[str, str] = field(default_factory=dict)
+    started_at_ns: int = 0
+    completed_at_ns: int = 0
 
 
 @dataclass
@@ -47,6 +56,8 @@ class Artifact:
     output_revision: str = ""
     tested: bool = False
     claims: list[dict[str, str]] = field(default_factory=list)
+    result: str = ""
+    blockers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +70,7 @@ class WorkerEnvelope:
     tests: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
     claims: list[dict[str, str]] = field(default_factory=list)
+    result: str = ""
 
 
 def workspace_revision(root: Path = WORKSPACE_ROOT) -> str:
@@ -67,6 +79,8 @@ def workspace_revision(root: Path = WORKSPACE_ROOT) -> str:
     if not root.exists():
         return digest.hexdigest()
     for path in sorted(root.rglob("*"), key=lambda item: str(item).casefold()):
+        if any(part in IGNORED_DIRECTORY_NAMES for part in path.relative_to(root).parts):
+            continue
         if not path.is_file() or path.is_symlink():
             continue
         try:
@@ -103,7 +117,8 @@ def parse_worker_envelope(text: str) -> WorkerEnvelope:
         return WorkerEnvelope(
             state="observed",
             summary=(first_line or "Livrable textuel produit.")[:500],
-            blockers=["Sortie non structurée ; preuves non indexées automatiquement."],
+            blockers=[],
+            result=text,
         )
     if not isinstance(raw, dict):
         return WorkerEnvelope(state="observed", summary="Livrable JSON non objet.")
@@ -125,6 +140,7 @@ def parse_worker_envelope(text: str) -> WorkerEnvelope:
         ))
     return WorkerEnvelope(
         state=state,
+        result=str(raw.get("result") or ""),
         summary=str(raw.get("summary") or "Résultat produit.").strip()[:1000],
         references=[str(item) for item in raw.get("references", []) if str(item).strip()]
         if isinstance(raw.get("references"), list) else [],
@@ -155,15 +171,64 @@ def compact_dependency(task: Any) -> str:
         references = ", ".join(artifact.references[:8]) or "aucune"
         return (
             f"{task.id} | état={artifact.state} | {artifact.summary}\n"
-            f"références={references} | révision={artifact.output_revision[:12]}"
+            f"références={references}"
+            + (" | résultat complet disponible via lire_resultat_tache" if artifact.result else "")
         )[:MAX_DEPENDENCY_CONTEXT_CHARACTERS]
     deliverable = str(getattr(task, "deliverable", "") or "")
     return f"{task.id} | {deliverable[:MAX_DEPENDENCY_CONTEXT_CHARACTERS]}"
 
 
+def task_paths(task: Any) -> list[str]:
+    """Infer paths from the existing contract; no extra planner fields/tokens."""
+    text = " ".join([task.title, task.description, getattr(task, "expected_output", ""),
+                     *getattr(task, "acceptance_criteria", [])])
+    return sorted(set(re.findall(r"(?<![\w.])(?:[\w@.-]+/)*[\w.-]+\.(?:py|js|jsx|ts|tsx|json|toml|yaml|yml|md|css|html)\b", text)))
+
+
+@lru_cache(maxsize=32)
+def _project_facts(signature: tuple, python_only: bool) -> str:
+    facts: dict[str, Any] = {}
+    for name, _size, _modified in signature:
+        path = WORKSPACE_ROOT / name
+        try:
+            if name == "package.json" and not python_only:
+                package = json.loads(path.read_text(encoding="utf-8"))
+                scripts = package.get("scripts", {})
+                facts["scripts"] = {key: value for key, value in scripts.items()
+                                    if key in {"test", "build", "lint", "typecheck"}}
+                facts["package_manager"] = package.get("packageManager", "voir lockfile")
+            elif name == "pyproject.toml":
+                import tomllib
+                project = tomllib.loads(path.read_text(encoding="utf-8"))
+                tool_config = project.get("tool", {})
+                facts["python_tools"] = [key for key in ("pytest", "ruff", "mypy") if key in tool_config]
+            elif name == "pytest.ini":
+                facts["pytest_config"] = name
+        except (OSError, ValueError, TypeError):
+            continue
+    return json.dumps(facts, ensure_ascii=False, separators=(",", ":")) if facts else ""
+
+
+def project_facts(task: Any) -> str:
+    signature = []
+    for name in ("package.json", "pyproject.toml", "pytest.ini"):
+        path = WORKSPACE_ROOT / name
+        try:
+            stat = path.stat()
+            if stat.st_size <= 64_000:
+                signature.append((name, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            pass
+    paths = task_paths(task)
+    return _project_facts(tuple(signature), bool(paths) and all(path.endswith(".py") for path in paths))[:1500]
+
+
 def compile_context(ledger: Any, task: Any, discovery_context: str = "") -> str:
     """Construit un contexte cible sans recopier les rapports complets."""
     parts: list[str] = []
+    facts = project_facts(task)
+    if facts:
+        parts.append("CONFIGURATION DU PROJET (extraite automatiquement)\n" + facts)
     if discovery_context:
         # Le Chef a déjà reçu les extraits complets pendant la planification.
         # Les workers reçoivent seulement le manifeste de chemins et peuvent

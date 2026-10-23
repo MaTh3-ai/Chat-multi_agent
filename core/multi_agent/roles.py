@@ -22,7 +22,6 @@ PLAN_JSON_SCHEMA = """{
       "assigned_tier": "nano",
       "capabilities": ["auto"],
       "max_retries": 1,
-      "max_escalations": 1,
       "depends_on": [],
       "dependency_state": "completed",
       "acceptance_criteria": ["critère observable"],
@@ -107,22 +106,23 @@ CONTRAINTES SÉMANTIQUES
   et les vérifications exigeantes ;
 - réserve expert aux tâches réellement critiques : arbitrage difficile,
   synthèse décisive ou raisonnement de haut niveau ;
-- capabilities vaut auto, read, write ou generate. Utilise read pour une
+- capabilities vaut auto, read, write, execute ou generate. Utilise read pour une
   lecture, write pour modifier directement le workspace avec les outils
   dédiés, et generate pour une réponse sans outil. auto est acceptable si le
   mode est évident ;
-- max_retries vaut 0, 1 ou 2 et max_escalations vaut 0 ou 1. Choisis le minimum
-  nécessaire : ces champs bornent le budget de la tâche ;
+- max_retries vaut 0, 1 ou 2 (défaut 1). Il borne les reprises réseau ;
+  ne prévois aucune boucle supplémentaire de relance de la tâche ;
 - depends_on contient uniquement des indices entiers de base 0 pointant vers
   des tâches antérieures ; laisse-le vide pour les tâches parallélisables ;
-- dependency_state vaut completed, applied, tested ou verified. Utilise
+- dependency_state vaut completed, applied ou tested. verified est réservé
+  aux anciens plans : aucun contrôle générique ne le produit automatiquement. Utilise
   applied pour une tâche qui doit lire des changements réellement écrits,
   tested pour une vérification qui dépend de tests exécutés et completed
   quand le simple résultat factuel de la dépendance suffit ;
 - chaque tâche possède au moins un critère d'acceptation observable ;
 - expected_output décrit la forme attendue ;
 - requires_review vaut true pour les livrables dont la justesse est critique :
-  ils seront soumis à un agent critique indépendant d'un tier supérieur, qui
+  ils seront soumis à un agent critique indépendant avec accès aux fichiers, qui
   vérifiera leur conformité aux critères d'acceptation avant la synthèse ;
   n'active pas ce drapeau sur une tâche triviale, la revue a un coût ;
 - utilise le plus petit nombre de tâches qui couvre le besoin ; une tâche
@@ -134,6 +134,16 @@ CONTRAINTES SÉMANTIQUES
   tâches, respecte-le en priorité.
 
 Avant d'envoyer la réponse, vérifie silencieusement qu'elle est valide avec json.loads().
+
+ÉCONOMIE DE COORDINATION
+- Omets les champs laissés à leur défaut : max_retries=1, requires_review=false,
+  depends_on=[], dependency_state=completed. N'émets pas max_escalations.
+- capabilities=["write"] pour modifier ; ["execute"] pour lancer des contrôles ;
+  ["read"] pour consulter ; ["generate"] pour un livrable textuel sans outils.
+- Utilise smart d'emblée pour du code complexe ; un petit modèle qui multiplie
+  les reprises n'est pas nécessairement économique.
+- Les états, chemins et preuves sont collectés par le programme. N'ajoute pas
+  de tâche chargée de rédiger un rapport ou de recopier ces informations.
 """
 
 
@@ -183,6 +193,8 @@ def critic_system_prompt(tier_label: str) -> str:
 Tu n'as pas produit le livrable que tu examines et tu ne le réécris pas.
 
 MÉTHODE
+- Tu disposes d'outils de lecture : ouvre seulement les zones nécessaires
+  pour vérifier un critère incertain. Ne redemande pas de rapport au worker.
 - Confronte le résultat uniquement aux critères d'acceptation transmis et aux
   preuves disponibles (fichiers écrits, sorties de tests, erreurs observées).
 - Signale seulement un défaut concret qui empêche un critère d'être satisfait.
@@ -249,25 +261,15 @@ CAPACITÉS ET HONNÊTETÉ
   produis PAS de livrable spéculatif. Ne coche pas « Contrôle qualité » comme
   réussi dans ce cas.
 
-Réponds uniquement avec un objet JSON court, sans Markdown :
-{{
-  "state": "observed|proposed|approved|applied|tested|verified",
-  "summary": "résultat factuel en une ou deux phrases",
-  "references": ["chemins ou symboles utiles"],
-  "evidence": [
-    {{"kind": "file_read|file_write|command|test|proposal", "reference": "chemin ou ID", "detail": "preuve courte"}}
-  ],
-  "proposal_ids": [],
-  "tests": [],
-  "blockers": [],
-  "claims": [
-    {{"subject": "élément vérifié", "predicate": "propriété", "value": "valeur observée"}}
-  ]
-}}
-Une écriture directe réussie est à l'état "applied". Un changement n'est
-"tested" qu'après un test réellement exécuté, et "verified" après un contrôle
-déterministe réussi. Réponds brièvement : résumé, fichiers changés, tests et
-blocages. Ne recopie ni fichiers, ni anciens rapports, ni contexte.
+COMPTE RENDU MINIMAL
+Pour une tâche qui écrit des fichiers, retourne seulement :
+{{"summary": "résultat utile en une ou deux phrases", "blockers": []}}
+Les chemins, écritures, sauvegardes, tests et états sont calculés automatiquement
+à partir des outils. Ne les recopie pas et ne produis pas de rapport à un autre agent.
+Pour un livrable textuel demandé (analyse, réponse, rédaction), ajoute "result"
+avec le contenu complet demandé : ce contenu constitue le livrable, il doit
+être préservé. Réserve "blockers" aux vrais obstacles, pas aux contrôles facultatifs.
+
 """
 
 
@@ -306,7 +308,7 @@ def worker_task_prompt(
                 (
                     f"Vise environ {target_output_tokens} tokens pour le compte rendu "
                     "final; le code nécessaire à un appel d'écriture n'est pas concerné. "
-                    "Cette cible n'est jamais un seuil de rejet. Préfère les outils "
+                    "Ce n'est jamais une limite : termine la tâche et préserve son livrable. Préfère les outils "
                     "directs et les changements ciblés, évite les répétitions et "
                     "ne génère aucun rapport narratif non demandé."
                 ),

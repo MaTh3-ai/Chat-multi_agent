@@ -1037,6 +1037,12 @@ def _phase_synthesis(chief) -> None:
 def _render_run_summary(chief) -> None:
     ledger = chief.ledger
     summary = ledger.metrics_summary() if hasattr(ledger, "metrics_summary") else {}
+    if summary.get("unknown_usage_calls"):
+        st.caption(f"Usage incomplet pour {summary['unknown_usage_calls']} appel(s) interrompu(s) : "
+                   "leur coût éventuel n'est pas compté comme nul.")
+    if summary.get("coordination_model_calls"):
+        st.caption(f"Les totaux incluent {summary['coordination_model_calls']} appel(s) d'entretien, "
+                   "de planification, de revue ou de synthèse.")
     # Visibilite constante de l'etat global du chantier (INTERVIEW, EXEC,
     # CANCELLED, etc.) : affiche hors expander pour rester lisible dans toutes
     # les phases, y compris apres une annulation ou une synthese.

@@ -19,7 +19,7 @@ def test_worker_prompt_includes_acceptance_contract():
     assert "Un correctif directement appliqué." in prompt
 
 
-def test_simple_plan_can_use_one_task_and_cost_estimate_counts_nested_retries():
+def test_simple_plan_can_use_one_task_and_cost_estimate_has_one_retry_owner():
     raw_plan = json.dumps({
         "objective": "Corriger un bug simple.",
         "assumptions": [],
@@ -43,7 +43,10 @@ def test_simple_plan_can_use_one_task_and_cost_estimate_counts_nested_retries():
     assert report.task_count == 1
     assert len(ledger.tasks) == 1
     assert ledger.tasks[0].capabilities == ["write"]
-    assert estimate_plan_cost(ledger) == get_tier("fast")["relative_cost"] * 4
+    assert ledger.tasks[0].acceptance_criteria == ["Le correctif est présent."]
+    assert ledger.tasks[0].expected_output == "Le fichier corrigé."
+    assert "Critères d" not in ledger.tasks[0].description
+    assert estimate_plan_cost(ledger) == get_tier("fast")["relative_cost"] * 2
 
 
 def test_truncated_report_preserves_successful_direct_write_evidence():
@@ -54,6 +57,8 @@ def test_truncated_report_preserves_successful_direct_write_evidence():
             "kind": "file_write",
             "reference": "src/module.py",
             "detail": "applied=true; backup=backups/module.py.bak",
+            "ok": True,
+            "applied": True,
         }],
         proposal_ids=["proposal-1"],
     )
@@ -64,7 +69,8 @@ def test_truncated_report_preserves_successful_direct_write_evidence():
     assert envelope.state == "applied"
     assert "src/module.py" in envelope.references
     assert envelope.proposal_ids == ["proposal-1"]
-    assert envelope.blockers
+    assert json.loads(serialized)["report_incomplete"]
+    assert not envelope.blockers
 
 
 def test_worker_prompt_allows_direct_edits_and_reports_truthfully():

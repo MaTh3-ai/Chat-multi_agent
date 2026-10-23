@@ -1,8 +1,7 @@
 # Dépendances de l'application (assistant IA + multi-agent)
 # Environnement cible : SageMaker AI Studio, auth via rôle IAM.
 #
-# Le module multi-agent n'ajoute AUCUNE dépendance externe :
-# la parallélisation utilise concurrent.futures (bibliothèque standard).
+# La parallélisation utilise concurrent.futures ; les reprises utilisent SQLite.
 
 # Interface
 # 1.37 minimum : le moniteur d'execution en arriere-plan repose sur
@@ -19,4 +18,7 @@ langchain-aws>=0.2
 langchain-core>=0.3
 
 # Orchestration d'agents (agent ReAct de l'assistant principal)
-langgraph>=0.2
+langgraph>=0.6,<2
+
+# Points de reprise persistants entre appels et redémarrages
+langgraph-checkpoint-sqlite>=2.0

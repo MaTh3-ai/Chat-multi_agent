@@ -14,7 +14,7 @@ MAX_TASKS = 24
 MIN_TASKS = 1
 MAX_TEXT_LENGTH = 30_000
 MAX_FIELD_LENGTH = 8_000
-VALID_CAPABILITIES = {"auto", "read", "write", "propose_write", "generate"}
+VALID_CAPABILITIES = {"auto", "read", "write", "execute", "propose_write", "generate"}
 VALID_DEPENDENCY_STATES = {"completed", "applied", "tested", "verified"}
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # Défauts JSON récurrents des sorties de modèles.
@@ -55,10 +55,9 @@ def estimate_plan_cost(ledger: TaskLedger) -> int:
     for task in ledger.tasks:
         tier_cost = get_tier(task.assigned_tier)["relative_cost"]
         retries_per_run = 1 + max(0, int(getattr(task, "max_retries", 1)))
-        execution_rounds = 1 + max(0, int(getattr(task, "max_escalations", 1)))
-        total += tier_cost * retries_per_run * execution_rounds
+        total += tier_cost * retries_per_run
         if task.requires_review:
-            total += tier_cost
+            total += get_tier("fast" if task.assigned_tier == "nano" else task.assigned_tier)["relative_cost"]
     return total
 
 
@@ -362,21 +361,13 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
             requires_review = False
         review_count += int(requires_review)
 
-        enriched_description = (
-            f"{description}\n\nSortie attendue : {expected_output}"
-            "\n\nCritères d'acceptation :\n"
-            + "\n".join(f"- {criterion}" for criterion in criteria)
-        )
-        if requires_review:
-            enriched_description += (
-                "\n\nRevue humaine ou critique ciblée requise avant synthèse."
-            )
-
         ledger.add_task(
             Task(
                 id=identifiers[index],
                 title=title,
-                description=enriched_description,
+                description=description,
+                expected_output=expected_output,
+                acceptance_criteria=criteria,
                 assigned_tier=tier,
                 capabilities=capabilities,
                 max_retries=max_retries,
@@ -394,7 +385,7 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
 
     estimated_cost_units = estimate_plan_cost(ledger)
     validation_warnings = [
-        "L'estimation suppose le nombre maximal de reprises et d'escalades ; "
+        "L'estimation relative compte les reprises et les revues demandées ; "
         "le coût réel peut être inférieur.",
     ]
     return ledger, PlanReport(

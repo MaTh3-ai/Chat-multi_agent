@@ -186,7 +186,8 @@ class CoordinationTest(unittest.TestCase):
         }))
         restored = TaskLedger.from_dict(ledger.to_dict())
         restored_task = restored.require_task("T01")
-        self.assertEqual(restored_task.artifact.state, "tested")
+        self.assertEqual(restored_task.artifact.state, "observed")
+        self.assertFalse(restored_task.artifact.tested)
         self.assertEqual(restored_task.artifact.evidence[0].reference, "a.py")
         self.assertEqual(restored_task.output_revision, "after")
 

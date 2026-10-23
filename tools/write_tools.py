@@ -26,12 +26,15 @@ import shutil
 import threading
 import tomllib
 import uuid
+import time
 from copy import deepcopy
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
+from core.agent_runtime import CURRENT_EXECUTION, path_lock
 
 from tools.custom_tools import (
     ALLOWED_TEXT_EXTENSIONS,
@@ -1510,6 +1513,30 @@ def clear_resolved_proposals() -> None:
 
 def _apply_direct_change(tool_object: Any, arguments: dict[str, Any]) -> str:
     """Valide, sauvegarde et applique une écriture sans étape d'approbation UI."""
+    path = resolve_workspace_path(str(arguments.get("chemin", "")))
+    with path_lock(path):
+        session = CURRENT_EXECUTION.get()
+        operation = session.operation_key(tool_object.name, arguments) if session else ""
+        if session:
+            previous = session.replay(operation, path)
+            if previous is not None:
+                return json.dumps(previous, ensure_ascii=False)
+            expected = session.read_versions.get(str(path))
+            actual = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            if expected is not None and actual != expected:
+                return json.dumps({"ok": False, "applied": False, "path": arguments["chemin"],
+                                   "error": "Fichier modifié depuis la lecture ; relire la zone avant de réessayer."}, ensure_ascii=False)
+        result = json.loads(_apply_direct_change_unlocked(tool_object, arguments))
+        if result.get("applied") is True:
+            result["content_hash"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            result["completed_at_ns"] = time.time_ns()
+            if session:
+                session.observe(path)
+                session.record_write(operation, result)
+        return json.dumps(result, ensure_ascii=False)
+
+
+def _apply_direct_change_unlocked(tool_object: Any, arguments: dict[str, Any]) -> str:
     raw_result = tool_object.invoke(arguments)
     try:
         prepared = json.loads(raw_result)
@@ -1553,7 +1580,7 @@ def _apply_direct_change(tool_object: Any, arguments: dict[str, Any]) -> str:
 def ecrire_fichier_directement(
     chemin: str,
     nouveau_contenu: str,
-    justification: str,
+    justification: str = "Modification demandée",
     autoriser_reduction_massive: bool = False,
 ) -> str:
     """Crée ou remplace directement un fichier texte du workspace.
@@ -1578,7 +1605,7 @@ def remplacer_bloc_directement(
     chemin: str,
     ancien_texte: str,
     nouveau_texte: str,
-    justification: str,
+    justification: str = "Modification demandée",
 ) -> str:
     """Remplace une occurrence exacte dans un fichier du workspace et applique le changement."""
     return _apply_direct_change(
@@ -1597,7 +1624,7 @@ def inserer_bloc_directement(
     chemin: str,
     ancre: str,
     contenu_a_inserer: str,
-    justification: str,
+    justification: str = "Modification demandée",
     position: str = "apres",
 ) -> str:
     """Insère un bloc autour d'une ancre unique et applique le changement."""
@@ -1617,7 +1644,7 @@ def inserer_bloc_directement(
 def supprimer_bloc_directement(
     chemin: str,
     texte_a_supprimer: str,
-    justification: str,
+    justification: str = "Modification demandée",
 ) -> str:
     """Supprime une occurrence exacte d'un bloc et applique le changement."""
     return _apply_direct_change(
@@ -1630,11 +1657,79 @@ def supprimer_bloc_directement(
     )
 
 
+@tool
+def appliquer_modifications_directement(modifications: list[dict[str, str]]) -> str:
+    """Applique ensemble des changements liés sur plusieurs fichiers.
+
+    Chaque élément contient chemin et soit contenu, soit ancien_texte/nouveau_texte.
+    Un seul changement par chemin. Tous sont prévalidés avant écriture ; sauvegardes
+    et restauration en cas d'erreur d'application. Aucun rapport/justification requis.
+    """
+    if not modifications or len(modifications) > 20:
+        return json.dumps({"ok": False, "error": "Fournir de 1 à 20 modifications."})
+    try:
+        paths = [resolve_workspace_path(item["chemin"]) for item in modifications]
+        if len(set(paths)) != len(paths):
+            raise ValueError("Un seul changement par fichier dans un lot.")
+    except (KeyError, TypeError, ValueError) as error:
+        return json.dumps({"ok": False, "error": str(error)})
+    session = CURRENT_EXECUTION.get()
+    operation = session.operation_key("batch", {"modifications": modifications}) if session else ""
+    prepared: list[str] = []
+    with ExitStack() as stack:
+        for path in sorted(paths):
+            stack.enter_context(path_lock(path))
+        if session:
+            replayed = [session.replay(operation + str(path), path) for path in paths]
+            if all(replayed):
+                return json.dumps({"ok": True, "files": replayed}, ensure_ascii=False)
+        try:
+            for path, item in zip(paths, modifications):
+                if session and str(path) in session.read_versions:
+                    current = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+                    if session.read_versions[str(path)] != current:
+                        raise ConcurrentModificationError(f"Relire {item['chemin']} : fichier modifié depuis la lecture.")
+                if "ancien_texte" in item:
+                    raw = proposer_remplacement_cible.invoke({"chemin": item["chemin"],
+                          "ancien_texte": item["ancien_texte"], "nouveau_texte": item["nouveau_texte"],
+                          "justification": "Modification groupée demandée"})
+                else:
+                    raw = proposer_modification_fichier.invoke({"chemin": item["chemin"],
+                          "nouveau_contenu": item["contenu"], "justification": "Modification groupée demandée"})
+                result = json.loads(raw)
+                if not result.get("ok") or not result.get("created"):
+                    raise FileModificationError(result.get("message") or result.get("error") or "Prévalidation refusée.")
+                prepared.append(result["proposal_id"])
+            results = approve_pending_proposals(prepared)
+            if not all(result.get("ok") for result in results):
+                raise FileModificationError(str(results[0].get("error", "Lot non appliqué.")))
+        except (FileModificationError, KeyError, ValueError, TypeError, OSError) as error:
+            for proposal_id in prepared:
+                try:
+                    reject_proposal(proposal_id)
+                except FileModificationError:
+                    pass
+            return json.dumps({"ok": False, "files": [], "error": str(error)}, ensure_ascii=False)
+        files = []
+        for path, item, result in zip(paths, modifications, results):
+            record = {"ok": True, "applied": True, "path": item["chemin"],
+                      "proposal_id": result["proposal_id"],
+                      "backup_path": result.get("result", {}).get("backup_path"),
+                      "content_hash": hashlib.sha256(path.read_bytes()).hexdigest(),
+                      "completed_at_ns": time.time_ns()}
+            if session:
+                session.observe(path)
+                session.record_write(operation + str(path), record)
+            files.append(record)
+        return json.dumps({"ok": True, "files": files}, ensure_ascii=False)
+
+
 DIRECT_WRITE_TOOLS = [
     ecrire_fichier_directement,
     remplacer_bloc_directement,
     inserer_bloc_directement,
     supprimer_bloc_directement,
+    appliquer_modifications_directement,
 ]
 
 

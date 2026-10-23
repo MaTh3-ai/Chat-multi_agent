@@ -13,6 +13,7 @@ from core.multi_agent.coordination import (
     parse_worker_envelope,
     repetition_ratio,
     workspace_revision,
+    file_content_hash,
 )
 
 STATE_INTERVIEW = "INTERVIEW"
@@ -55,6 +56,9 @@ class TaskMetrics:
     files_read: int = 0
     artifacts_validated: int = 0
     tokens_per_validated_artifact: float | None = None
+    unknown_usage_calls: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
 
 
 @dataclass
@@ -67,6 +71,7 @@ class TaskAttempt:
     error: str | None = None
     retryable: bool = False
     latency_ms: float | None = None
+    metrics: TaskMetrics = field(default_factory=TaskMetrics)
 
 
 @dataclass
@@ -90,6 +95,9 @@ class Task:
     description: str
     assigned_tier: str
     assigned_role: str = "worker"
+    acceptance_criteria: list[str] = field(default_factory=list)
+    expected_output: str = ""
+    execution_id: str = field(default_factory=lambda: uuid4().hex)
     capabilities: list[str] = field(default_factory=list)
     max_retries: int = 1
     max_escalations: int = 1
@@ -126,7 +134,8 @@ class Task:
         data.setdefault("max_escalations", 1)
         data.setdefault("dependency_state", "completed")
         data["metrics"] = TaskMetrics(**data.get("metrics", {}))
-        data["attempts"] = [TaskAttempt(**item) for item in data.get("attempts", [])]
+        data["attempts"] = [TaskAttempt(**{**item, "metrics": TaskMetrics(**item.get("metrics", {}))})
+                            for item in data.get("attempts", [])]
         artifact = data.get("artifact")
         if isinstance(artifact, dict):
             artifact = dict(artifact)
@@ -156,6 +165,20 @@ class TaskLedger:
     discovered_files: list[str] = field(default_factory=list)
     discovery_errors: list[str] = field(default_factory=list)
     contradictions: list[dict[str, Any]] = field(default_factory=list)
+    coordination_metrics: TaskMetrics = field(default_factory=TaskMetrics)
+
+    @staticmethod
+    def _record_task_metrics(task: Task, metrics: TaskMetrics) -> None:
+        if task.attempts:
+            task.attempts[-1].metrics = metrics
+            combined = TaskMetrics(**vars(metrics))
+            for name in ("input_tokens", "output_tokens", "total_tokens", "model_calls", "retry_count",
+                         "unknown_usage_calls", "cache_read_tokens", "cache_write_tokens"):
+                values = [getattr(attempt.metrics, name) for attempt in task.attempts]
+                setattr(combined, name, sum(value or 0 for value in values) if any(value is not None for value in values) else None)
+            task.metrics = combined
+        else:
+            task.metrics = metrics
 
     def __post_init__(self) -> None:
         if self.state not in VALID_STATES:
@@ -277,6 +300,15 @@ class TaskLedger:
 
     def sync_artifact_states(self) -> None:
         """Réconcilie les artefacts proposés avec l'état réel des propositions."""
+        for task in self.tasks:
+            artifact = task.artifact
+            if artifact and artifact.tested and any(
+                file_content_hash(path) != digest
+                for item in artifact.evidence if item.source == "tool" and item.kind == "test"
+                for path, digest in item.checked_files.items()
+            ):
+                artifact.tested = False
+                artifact.state = "applied" if any(item.applied for item in artifact.evidence) else "observed"
         proposal_ids = [
             proposal_id
             for task in self.tasks if task.artifact
@@ -292,7 +324,7 @@ class TaskLedger:
             if not artifact or not artifact.proposal_ids:
                 continue
             current = [statuses.get(item, "unknown") for item in artifact.proposal_ids]
-            if current and all(item == "approved" for item in current):
+            if current and all(item == "approved" for item in current) and STATE_RANK[artifact.state] < STATE_RANK["applied"]:
                 artifact.state = "applied"
                 task.output_revision = workspace_revision()
                 artifact.output_revision = task.output_revision
@@ -336,7 +368,8 @@ class TaskLedger:
         self.set_status(task_id, STATUS_DOING)
         return task.attempt_count
 
-    def set_deliverable(self, task_id: str, content: str, metrics: TaskMetrics | None = None) -> None:
+    def set_deliverable(self, task_id: str, content: str, metrics: TaskMetrics | None = None,
+                        trusted_evidence: list[dict[str, Any]] | None = None) -> None:
         if not content or not content.strip():
             raise ValueError("Un livrable termine ne peut pas etre vide.")
         task = self.require_task(task_id)
@@ -345,22 +378,34 @@ class TaskLedger:
         task.error_type = None
         task.retryable = False
         if metrics is not None:
-            task.metrics = metrics
+            self._record_task_metrics(task, metrics)
         envelope = parse_worker_envelope(content)
-        successful_test = any(
-            item.kind == "test"
-            and ("ok=true" in item.detail.casefold() or "returncode=0" in item.detail.casefold())
-            for item in envelope.evidence
+        actual = [Evidence(
+            kind=str(item.get("kind", "command")), reference=str(item.get("reference", "")),
+            detail=str(item.get("detail", "")), content_hash=item.get("content_hash"), source="tool",
+            ok=item.get("ok"), applied=item.get("applied") is True,
+            sequence=int(item.get("sequence", -1)), category=str(item.get("category", "")),
+            checked_files=item.get("checked_files") or {},
+            started_at_ns=int(item.get("started_at_ns") or 0),
+            completed_at_ns=int(item.get("completed_at_ns") or 0),
+        ) for item in (trusted_evidence or [])]
+        writes = [item for item in actual if item.kind == "file_write" and item.ok is True and item.applied]
+        last_write = max((item.sequence for item in writes), default=-1)
+        last_write_time = max((item.completed_at_ns for item in writes), default=0)
+        latest_tests = {item.reference: item for item in actual
+                        if item.kind == "test" and (
+                            item.started_at_ns >= last_write_time if last_write_time else item.sequence > last_write)}
+        successful_test = bool(latest_tests) and all(
+            item.ok is True
+            and (not last_write_time or item.started_at_ns >= last_write_time)
+            and all(write.reference in item.checked_files for write in writes)
+            and all(file_content_hash(path) == digest for path, digest in item.checked_files.items())
+            for item in latest_tests.values()
         )
-        successful_write = any(
-            item.kind == "file_write"
-            and "applied=true" in item.detail.casefold()
-            for item in envelope.evidence
-        )
-        artifact_state = envelope.state
-        if successful_write and STATE_RANK.get(artifact_state, -1) < STATE_RANK["applied"]:
-            artifact_state = "applied"
-        if successful_test and artifact_state not in {"proposed", "approved"}:
+        # A summary or a list of test names cannot promote a task. "verified"
+        # is reserved for a future explicit check of all acceptance criteria.
+        artifact_state = "applied" if writes else "proposed" if envelope.state == "proposed" else "observed"
+        if successful_test:
             artifact_state = "tested"
         task.artifact = Artifact(
             id=f"{task.id}:{task.attempt_count}",
@@ -368,14 +413,17 @@ class TaskLedger:
             kind="worker_result",
             state=artifact_state,
             summary=envelope.summary,
-            references=envelope.references,
-            evidence=envelope.evidence,
-            proposal_ids=envelope.proposal_ids,
+            references=list(dict.fromkeys(item.reference for item in actual
+                                           if item.kind in {"file_read", "file_write"} and item.ok is True))
+            if trusted_evidence is not None else envelope.references,
+            evidence=actual or envelope.evidence,
+            proposal_ids=envelope.proposal_ids if trusted_evidence is not None else [],
             input_revision=task.input_revision,
             output_revision=task.output_revision,
-            tested=bool(envelope.tests) or successful_test
-            or STATE_RANK[artifact_state] >= STATE_RANK["tested"],
+            tested=successful_test,
             claims=envelope.claims,
+            result=envelope.result,
+            blockers=envelope.blockers,
         )
         self._detect_claim_contradictions(task)
         task.metrics.repetition_ratio = repetition_ratio(content)
@@ -393,7 +441,7 @@ class TaskLedger:
             task.attempts[-1].status = STATUS_DONE
             task.attempts[-1].completed_at = utc_now_iso()
             task.attempts[-1].latency_ms = task.metrics.latency_ms
-        self.set_status(task_id, STATUS_DONE)
+        self.set_status(task_id, STATUS_REVIEW if envelope.blockers else STATUS_DONE)
         self.refresh_blocked_tasks()
 
     def _detect_claim_contradictions(self, current_task: Task) -> None:
@@ -450,7 +498,7 @@ class TaskLedger:
         task.retryable = retryable
         task.notes = (task.notes + f"\n[ERREUR] {error}").strip()
         if metrics is not None:
-            task.metrics = metrics
+            self._record_task_metrics(task, metrics)
         if task.attempts:
             attempt = task.attempts[-1]
             attempt.status = STATUS_FAILED
@@ -564,7 +612,7 @@ class TaskLedger:
         return grouped
 
     def metrics_summary(self) -> dict[str, Any]:
-        known = [task.metrics for task in self.tasks]
+        known = [task.metrics for task in self.tasks] + [self.coordination_metrics]
         def total(field_name: str) -> int:
             return sum(getattr(item, field_name) or 0 for item in known)
         artifacts = sum(item.artifacts_validated for item in known)
@@ -573,7 +621,7 @@ class TaskLedger:
             sum(item.repetition_ratio for item in known) / len(known)
             if known else 0.0
         )
-        return {"task_count": len(self.tasks), "done": len(self.tasks_with_status(STATUS_DONE)), "failed": len(self.tasks_with_status(STATUS_FAILED)), "blocked": len(self.tasks_with_status(STATUS_BLOCKED)), "cancelled": len(self.tasks_with_status(STATUS_CANCELLED)), "model_calls": total("model_calls"), "retries": total("retry_count"), "input_tokens": total("input_tokens"), "output_tokens": total("output_tokens"), "total_tokens": total_tokens, "files_read": total("files_read"), "artifacts_validated": artifacts, "tokens_per_validated_artifact": (total_tokens / artifacts if artifacts else None), "average_repetition_ratio": repetition}
+        return {"task_count": len(self.tasks), "done": len(self.tasks_with_status(STATUS_DONE)), "failed": len(self.tasks_with_status(STATUS_FAILED)), "blocked": len(self.tasks_with_status(STATUS_BLOCKED)), "cancelled": len(self.tasks_with_status(STATUS_CANCELLED)), "model_calls": total("model_calls"), "coordination_model_calls": self.coordination_metrics.model_calls, "retries": total("retry_count"), "input_tokens": total("input_tokens"), "output_tokens": total("output_tokens"), "total_tokens": total_tokens, "unknown_usage_calls": total("unknown_usage_calls"), "cache_read_tokens": total("cache_read_tokens"), "cache_write_tokens": total("cache_write_tokens"), "files_read": total("files_read"), "artifacts_validated": artifacts, "tokens_per_validated_artifact": (total_tokens / artifacts if artifacts else None), "average_repetition_ratio": repetition}
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -581,6 +629,7 @@ class TaskLedger:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskLedger":
         payload = dict(data)
+        payload["coordination_metrics"] = TaskMetrics(**payload.get("coordination_metrics", {}))
         payload["tasks"] = [Task.from_dict(item) for item in payload.get("tasks", [])]
         payload["events"] = [Event(**item) for item in payload.get("events", [])]
         return cls(**payload)

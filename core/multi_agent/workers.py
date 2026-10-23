@@ -322,13 +322,19 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
             if payload.get("created") and proposal_id:
                 proposal_ids.append(str(proposal_id))
             detail = str(payload.get("message") or payload.get("error") or "")[:300]
+            if payload.get("applied"):
+                detail = (
+                    "applied=true; "
+                    f"backup={payload.get('backup_path') or 'none'}"
+                )
             if name == "executer_commande_controlee":
                 detail = (
                     f"ok={str(bool(payload.get('ok'))).lower()}; "
                     f"returncode={payload.get('returncode')}"
                 )
         kind = (
-            "proposal" if name.startswith("proposer_")
+            "file_write" if name.endswith("_directement")
+            else "proposal" if name.startswith("proposer_")
             else "test" if name == "executer_commande_controlee"
             else "file_read"
         )
@@ -352,9 +358,37 @@ def _merge_tool_evidence(text: str, output: ModelOutput) -> str:
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return text
+        payload = None
     if not isinstance(payload, dict):
-        return text
+        # Un worker peut avoir appliqué les fichiers correctement puis manquer
+        # de tokens pour son bref rapport JSON. Préserve la preuve des écritures
+        # et évite de classer tout le travail comme échec ou artefact inconnu.
+        if not output.tool_evidence:
+            return text
+        writes = [
+            item for item in output.tool_evidence
+            if item.get("kind") == "file_write"
+        ]
+        payload = {
+            "state": "applied" if writes else "observed",
+            "summary": (
+                "Modifications écrites dans le workspace."
+                if writes
+                else "Le worker a utilisé des outils; son rapport est incomplet."
+            ),
+            "references": list(dict.fromkeys(
+                item.get("reference", "")
+                for item in output.tool_evidence
+                if item.get("reference")
+            )),
+            "evidence": output.tool_evidence,
+            "proposal_ids": output.proposal_ids,
+            "blockers": (
+                ["Le rapport final a été tronqué; les écritures prouvées sont conservées."]
+                if output.truncated else []
+            ),
+        }
+        return json.dumps(payload, ensure_ascii=False)
     evidence = payload.get("evidence")
     if not isinstance(evidence, list):
         evidence = []
@@ -488,10 +522,12 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                     task.title,
                     task.description,
                     context,
+                    acceptance_criteria=getattr(task, "acceptance_criteria", []),
+                    expected_output=getattr(task, "expected_output", ""),
                     target_output_tokens=TARGET_OUTPUT_TOKENS,
                 )
                 declared_capabilities = set(getattr(task, "capabilities", []) or [])
-                if "propose_write" in declared_capabilities:
+                if {"write", "propose_write"} & declared_capabilities:
                     mode = "edition"
                 elif "read" in declared_capabilities:
                     mode = "lecture"
@@ -527,14 +563,35 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
             result.truncated = output.truncated
             result.continuations = output.continuations
             if output.truncated:
-                # La coupure est signalee comme une LIMITE explicite, pas comme
-                # une erreur : le livrable partiel reste exploitable et la revue
-                # humaine sait exactement ce qui manque.
-                deliverable += (
-                    "\n\n[LIVRABLE INCOMPLET] La sortie reste tronquee apres "
-                    f"{output.continuations} reprise(s) automatique(s). "
-                    "Relance la tache sur un perimetre plus etroit pour obtenir la suite."
+                # Ne colle pas un marqueur en texte libre à la fin du JSON :
+                # cela détruirait l'enveloppe et ferait perdre les preuves.
+                try:
+                    partial = json.loads(deliverable)
+                except (json.JSONDecodeError, TypeError):
+                    partial = None
+                if not isinstance(partial, dict):
+                    partial = {
+                        "state": "observed",
+                        "summary": (deliverable or "Sortie incomplète.")[:500],
+                        "references": [],
+                        "evidence": output.tool_evidence,
+                        "proposal_ids": output.proposal_ids,
+                        "tests": [],
+                        "blockers": [],
+                        "claims": [],
+                    }
+                blockers = partial.get("blockers")
+                if not isinstance(blockers, list):
+                    blockers = []
+                blockers.append(
+                    "Rapport final tronqué après "
+                    f"{output.continuations} continuation(s); "
+                    "les écritures déjà prouvées sont conservées."
                 )
+                partial["blockers"] = blockers
+                if any(item.get("kind") == "file_write" for item in output.tool_evidence):
+                    partial["state"] = "applied"
+                deliverable = json.dumps(partial, ensure_ascii=False)
             result.deliverable = deliverable
             result.metrics = output.metrics
             result.metrics.model_calls = max(result.metrics.model_calls, attempt)

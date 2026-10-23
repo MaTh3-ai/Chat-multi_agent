@@ -319,14 +319,24 @@ class ChefDeProjet:
         metrics = self.ledger.coordination_metrics
         metrics.total_tokens = (metrics.input_tokens or 0) + (metrics.output_tokens or 0)
 
+    def _chief_tier(self, tier: str | None = None) -> str:
+        if tier is not None:
+            return tier
+        configured = os.getenv("MULTI_AGENT_CHIEF_TIER")
+        if configured:
+            return configured
+        # Use the current request before a ledger objective exists. A large
+        # task count alone does not justify Opus. No paid routing classifier.
+        request = self.ledger.objective or next(
+            (text for role, text in reversed(self.history) if role == "user"), "")
+        if re.search(r"sécurité|cryptograph|authentification|migration.*(?:base|données)|architecture", request, re.I):
+            return "smart"
+        if any(task.assigned_tier in {"smart", "expert"} for task in self.ledger.tasks):
+            return "smart"
+        return "fast"
+
     def _chief_model(self, tier: str | None = None):
-        selected_tier = tier or os.getenv("MULTI_AGENT_CHIEF_TIER", "smart")
-        # Routing is deterministic. No paid classifier and no repeated cheap
-        # attempts before using a capable model for a clearly difficult case.
-        if tier is None and (len(self.ledger.tasks) >= 6 or re.search(
-            r"sécurité|cryptograph|authentification|migration.*(?:base|données)", self.ledger.objective, re.I
-        )):
-            selected_tier = CHIEF_TIER
+        selected_tier = self._chief_tier(tier)
         if selected_tier not in self._chief_models:
             alias = resolve_tier_to_model_alias(selected_tier)
 
@@ -384,12 +394,16 @@ class ChefDeProjet:
         from tools.custom_tools import PROJECT_ROOT
         session = ExecutionSession(key=f"{self.ledger.run_id}:chief", root=PROJECT_ROOT / ".agent_state",
                                    run_budget=self._budget())
+        selected_tier = self._chief_tier(tier)
         token = CURRENT_EXECUTION.set(session)
         try:
-            output = invoke_model_with_continuation(self._chief_model(tier), messages)
+            output = invoke_model_with_continuation(self._chief_model(selected_tier), messages)
         finally:
             CURRENT_EXECUTION.reset(token)
             self._record_coordination_usage(session.budget)
+            self.ledger.log_event("coordination_usage", "Appel du chef comptabilisé.",
+                                  model_alias=resolve_tier_to_model_alias(selected_tier),
+                                  metadata=session.budget.snapshot())
             # A timeout may follow a billed request with no usable response.
             # Persist the user's latest feedback and unknown-usage counter now.
             self._trigger_save()
@@ -719,7 +733,7 @@ class ChefDeProjet:
                 raw = self._ask_chief(
                     [("user", instruction)],
                     include_history=False,
-                    tier=CHIEF_TIER if exc.semantic else None,
+                    tier="smart" if exc.semantic else "fast",
                 )
 
         raise PlanError(
@@ -1194,6 +1208,13 @@ class ChefDeProjet:
         if any(UNAPPLIED_EDIT_BLOCKER in artifact.blockers for artifact in artifacts):
             return self._save_final(self._execution_summary())
         open_conflicts = any(not item.get("resolved") for item in self.ledger.contradictions)
+        # Code execution facts need no editorial rewrite, even when a worker
+        # left free text in result. Keep requested textual deliverables intact.
+        if artifacts and not open_conflicts and all(
+            set(task.capabilities) & {"write", "propose_write", "execute"}
+            and "generate" not in task.capabilities for task in self.ledger.tasks
+        ):
+            return self._save_final(self._execution_summary())
         if len(self.ledger.tasks) == 1 and artifacts and artifacts[0].result and not (
             failed or blocked or cancelled or to_review or open_conflicts
         ):
@@ -1320,7 +1341,8 @@ Principes :
         # complet augmenterait le coût et pourrait réintroduire des versions
         # obsolètes ou contradictoires du besoin.
         try:
-            final = self._ask_chief([("user", instruction)], include_history=False)
+            final = self._ask_chief([("user", instruction)], include_history=False,
+                                    tier="smart" if open_conflicts else "fast")
         except ExecutionBudgetExceeded:
             final = self._execution_summary()
 

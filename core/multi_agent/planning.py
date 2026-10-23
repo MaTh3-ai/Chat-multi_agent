@@ -15,6 +15,9 @@ MIN_TASKS = 1
 MAX_TEXT_LENGTH = 30_000
 MAX_FIELD_LENGTH = 8_000
 VALID_CAPABILITIES = {"auto", "read", "write", "execute", "propose_write", "generate"}
+# Classification included in the existing planning call; Python resolves the
+# model. Legacy plans and explicit model choices keep assigned_tier priority.
+WORK_KIND_TIERS = {"extraction": "nano", "routine": "fast", "complex": "smart", "critical": "expert"}
 VALID_DEPENDENCY_STATES = {"completed", "applied", "tested", "verified"}
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # Défauts JSON récurrents des sorties de modèles.
@@ -317,7 +320,13 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
                 f"{where} : aucun critère d'acceptation fourni, critère générique appliqué."
             )
 
-        tier = _normalize_tier(raw_task.get("assigned_tier"), corrections, where)
+        work_kind = str(raw_task.get("work_kind", "")).strip().lower()
+        requested_tier = raw_task.get("assigned_tier")
+        if not requested_tier and work_kind in WORK_KIND_TIERS:
+            requested_tier = WORK_KIND_TIERS[work_kind]
+        tier = _normalize_tier(requested_tier, corrections, where)
+        if work_kind:
+            ledger.log_decision(f"{where} : travail {work_kind}, modèle {tier}.")
         capabilities = _normalize_capabilities(
             raw_task.get("capabilities"), corrections, where
         )

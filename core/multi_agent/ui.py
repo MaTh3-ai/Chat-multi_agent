@@ -1072,14 +1072,29 @@ def _render_run_summary(chief) -> None:
         rows = []
         for task in ledger.tasks:
             metrics = task.metrics
-            rows.append({"Étape": task.title, "Modèle": task.assigned_tier,
+            rows.append({"Étape": task.title, "Modèle": resolve_tier_to_model_alias(task.assigned_tier),
                          "Appels": metrics.model_calls, "Entrée": metrics.input_tokens or 0,
-                         "Sortie": metrics.output_tokens or 0, "Cache lu": metrics.cache_read_tokens})
+                         "Sortie": metrics.output_tokens or 0, "Cache lu": metrics.cache_read_tokens,
+                         "Cache écrit": metrics.cache_write_tokens})
         metrics = ledger.coordination_metrics
         rows.append({"Étape": "Coordination", "Modèle": "chef / revue",
                      "Appels": metrics.model_calls, "Entrée": metrics.input_tokens or 0,
-                     "Sortie": metrics.output_tokens or 0, "Cache lu": metrics.cache_read_tokens})
+                     "Sortie": metrics.output_tokens or 0, "Cache lu": metrics.cache_read_tokens,
+                     "Cache écrit": metrics.cache_write_tokens})
         st.dataframe(rows, hide_index=True, use_container_width=True)
+        chief_usage = [event for event in ledger.events if event.kind == "coordination_usage"]
+        if chief_usage:
+            with st.expander("Appels du chef par modèle"):
+                st.dataframe([{"Modèle": event.model_alias,
+                               "Appels": event.metadata.get("model_calls", 0),
+                               "Entrée": event.metadata.get("input_tokens", 0),
+                               "Sortie": event.metadata.get("output_tokens", 0),
+                               "Cache lu": event.metadata.get("cache_read_tokens", 0),
+                               "Cache écrit": event.metadata.get("cache_write_tokens", 0),
+                               "Usage inconnu": event.metadata.get("unknown_usage_calls", 0)}
+                              for event in chief_usage], hide_index=True, use_container_width=True)
+                st.caption("Détail déjà inclus dans Coordination. Les revues indépendantes ne figurent pas ici. "
+                           "Les anciens appels peuvent ne pas disposer de ce détail.")
         st.caption("Les fichiers lus sont des fichiers distincts ; ce nombre ne mesure pas "
                    "les relectures du contexte. Les artefacts contrôlés ne correspondent pas "
                    "à une couverture complète du code.")

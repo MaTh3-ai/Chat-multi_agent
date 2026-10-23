@@ -19,7 +19,7 @@ PLAN_JSON_SCHEMA = """{
     {
       "title": "titre court orienté résultat",
       "description": "consigne autonome et bornée",
-      "assigned_tier": "nano",
+      "work_kind": "routine",
       "capabilities": ["auto"],
       "max_retries": 1,
       "depends_on": [],
@@ -73,9 +73,13 @@ CONTRAT COMPACT
   périmètre demandé ; ne recopie pas description. expected_output : forme du livrable, sans répéter les critères.
 - Conserve toute exigence utile de l'utilisateur, même longue. Une consigne plus
   détaillée ne doit pas devenir une demande de code ou de rapport plus volumineux.
-- assigned_tier : nano pour extraction simple ; fast pour travail ciblé courant ;
-  smart pour code ou analyse complexe ; expert pour arbitrage critique justifié.
-  Ne multiplie pas les essais de petits modèles pour une tâche manifestement difficile.
+- work_kind : extraction pour tri/extraction bornée (Nova) ; routine pour correction
+  localisée, documentation ou transformation claire, y compris du code (Haiku) ;
+  complex pour diagnostic ambigu, conception ou logique liée entre fichiers (Sonnet) ;
+  critical pour arbitrage exceptionnel exigeant une expertise supérieure (Opus).
+  Python sélectionne le modèle. assigned_tier reste accepté pour un choix explicite
+  demandé par l'utilisateur ; sinon omets-le. Le mot « code » ne suffit pas à choisir complex.
+  Ne commence pas par un petit modèle pour une tâche manifestement difficile.
 - capabilities : read pour consulter, write pour modifier, execute pour contrôler,
   generate pour rédiger sans outil ; auto reste compatible avec les anciens plans.
 - Si une commande exacte suffit sans diagnostic, ajoute command (liste d'arguments,
@@ -86,6 +90,9 @@ CONTRAT COMPACT
   utile. Les outils collectent états, chemins et preuves ; aucun agent rapporteur.
 - Respecte le nombre d'agents explicitement demandé. Sinon, utilise le plus petit
   nombre de tâches qui couvre le besoin, sans revue ou synthèse intermédiaire par défaut.
+  Sépare un travail simple d'un travail complexe seulement si son périmètre est
+  autonome et si le gain dépasse le coût du transfert et de la relecture du contexte.
+  Ne délègue ni la lecture préalable nécessaire au raisonnement, ni un résumé de suivi.
 - Omets les valeurs par défaut : max_retries=1, requires_review=false, depends_on=[],
   dependency_state=completed. max_retries accepte 0 à 2 ; n'émets pas max_escalations.
 """

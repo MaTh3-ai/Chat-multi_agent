@@ -692,3 +692,34 @@ Sources de compatibilité : documentation AWS Prompt caching et intégration
 ChatBedrock de LangChain. Validation sans fournisseur : 69 tests avant l'ajout
 du contrôle de migration, puis vérification ciblée de ce contrôle. Les économies
 réelles demandent un prochain run avec des lectures de cache non nulles.
+
+### Routage économique et coût de coordination
+
+Le plan peut décrire `work_kind` : `extraction` résout vers Nova (`nano`),
+`routine` vers Haiku (`fast`), `complex` vers Sonnet (`smart`), `critical` vers
+Opus (`expert`). Ce classement fait partie de l'appel de planification existant ;
+Python applique la correspondance sans classificateur LLM supplémentaire.
+`assigned_tier` reste prioritaire lorsqu'il est fourni, notamment par un ancien
+plan ou un choix explicite de l'utilisateur. Une correction de code localisée
+peut être routine ; un diagnostic ambigu ou une logique transverse reste complexe.
+La lecture nécessaire au raisonnement n'est pas externalisée automatiquement :
+une délégation n'a de sens que si elle amortit le transfert de contexte.
+
+Le chef utilise Haiku par défaut. Une demande concernant sécurité, architecture
+ou migration de données, ou un chantier comprenant un worker complexe, utilise
+Sonnet. Le nombre de tâches seul ne déclenche plus Opus. Les choix explicites
+`MULTI_AGENT_CHIEF_TIER` et les tiers passés aux appels restent prioritaires.
+Une réparation de format utilise Haiku ; une réparation sémantique utilise Sonnet.
+La synthèse des tâches d'édition/exécution sans livrable textuel explicitement
+requis est déterministe, même si le worker a laissé du texte dans `result`.
+Les synthèses textuelles multiples utilisent Haiku, ou Sonnet en présence de
+contradictions ouvertes. Les résultats complets restent dans les artefacts.
+
+Chaque appel du chef produit un événement numérique `coordination_usage` avec
+le modèle effectivement sélectionné et les compteurs d'usage/cache. Le détail
+UI est déjà inclus dans le total Coordination, jamais additionné une seconde
+fois. Les revues et anciens appels restent dans l'agrégat et sont distingués
+dans la légende. Aucun prix AWS n'est déduit des unités relatives du catalogue.
+Les tests de routage ne démontrent pas une économie monétaire ni une qualité
+équivalente : celles-ci se mesurent sur des demandes comparables en suivant
+les modèles, entrées/sorties/cache, reprises et taux d'achèvement.

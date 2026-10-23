@@ -125,7 +125,10 @@ telle proposition apparaissait dans l'interface sans pouvoir être approuvée.
 
 ### Approbation
 
-Seule l'interface peut appeler `approve_proposal()` ou `reject_proposal()`.
+Pour le chat classique, seule l'interface peut appeler `approve_proposal()` ou
+`reject_proposal()`. Les workers multi-agents utilisent des outils d'écriture
+directe distincts : ceux-ci appliquent la modification avec sauvegarde et
+validation syntaxique, sans proposition en attente.
 
 L'interface propose aussi une validation groupée (`approve_pending_proposals`)
 et un mode optionnel de validation automatique. La validation groupée constitue
@@ -163,8 +166,10 @@ le suivi et l'amélioration des prompts.
 ### Protocole de coordination compact
 
 Chaque worker retourne un objet JSON court contenant l'état de l'artefact,
-son résumé, ses références, ses preuves, ses tests, ses propositions et ses
-affirmations structurées. Le `TaskLedger` transforme cette sortie en `Artifact`
+son résumé, ses références, ses preuves, ses tests et ses affirmations
+structurées. En mode multi-agent, les modifications sont écrites directement
+dans le workspace par des outils bornés, sauvegardés et validés; le circuit
+d'approbation reste réservé au chat classique. Le `TaskLedger` transforme cette sortie en `Artifact`
 persistant. Une sortie historique non structurée reste acceptée, mais elle est
 marquée comme telle et n'alimente pas automatiquement le registre de preuves.
 
@@ -255,14 +260,13 @@ modèle ; ils ne représentent pas des managers récursifs.
 
 Ce choix suit un pattern de production plus robuste pour ce type d'application :
 
-- le plan est une structure déclarative validée avant exécution ;
+- le plan est une structure déclarative compacte, validée avant exécution ;
 - les dépendances forment un DAG borné, exécuté par vagues parallèles ;
-- l'escalade de tier est automatique mais limitée par tâche et par nombre de
-  relances ;
-- une revue indépendante est déclenchée explicitement pour les livrables
-  critiques ;
-- l'humain conserve la validation du plan, des propositions d'écriture et de la
-  synthèse ;
+- les erreurs transitoires peuvent être relancées au même tier, sans escalade
+  coûteuse sur les erreurs permanentes ;
+- une revue indépendante est réservée aux livrables critiques ;
+- les workers peuvent écrire directement dans le workspace; l'humain garde la
+  visibilité sur le plan et la synthèse, sans approbation fichier par fichier ;
 - les coûts, les appels et les erreurs restent observables dans le ledger.
 
 Un sous-chef ou une délégation récursive ne doit être ajouté que si un besoin
@@ -327,12 +331,14 @@ des fichiers accessibles.
 ### États du chantier
 
 ```text
-INTERVIEW -> DISCOVERY -> PLANIF -> validation humaine -> EXEC
-EXEC -> REVIEW -> validation humaine -> SYNTHESE
+DISCOVERY ciblée -> INTERVIEW si nécessaire -> PLANIF -> validation du plan -> EXEC
+EXEC -> REVIEW sélective -> SYNTHESE
 Tout état peut évoluer vers CANCELLED selon le flux d'interface.
 ```
 
-La découverte réelle du workspace précède toujours la planification.
+La découverte déterministe des consignes et fichiers du projet précède
+l'entretien. Le chef ne pose une question que si la réponse n'est pas
+déductible du workspace et change réellement le plan ou un critère.
 
 Les états connus sont :
 

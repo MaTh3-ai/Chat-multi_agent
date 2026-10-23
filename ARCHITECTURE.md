@@ -472,7 +472,11 @@ Bedrock) couvre la cohérence de l'éditeur de plan :
 
 - Client mis en cache par région dans `llm_engine.py`.
 - Timeouts configurables : `BEDROCK_CONNECT_TIMEOUT` et
-  `BEDROCK_READ_TIMEOUT`.
+  `BEDROCK_READ_TIMEOUT` (900 s par défaut). Redémarrer le processus après
+  modification de ces variables. Une `ReadTimeoutError` ne relance pas
+  automatiquement la requête : Bedrock peut l’avoir traitée et facturée sans
+  réponse exploitable. Son coût est alors compté comme inconnu. La demande, les
+  résultats antérieurs et les métriques sont sauvegardés avant le retour d’erreur.
 - Retry SDK court via `BEDROCK_SDK_TOTAL_MAX_ATTEMPTS` pour ne pas multiplier
   silencieusement les retries déjà gérés dans les workers.
 - La température est normalisée par `sanitize_temperature()`.

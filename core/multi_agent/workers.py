@@ -124,8 +124,8 @@ BASE_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 8.0
 JITTER_SECONDS = 0.35
 
-_RETRYABLE_ERROR_NAMES = {"ThrottlingException", "ModelTimeoutException", "ServiceUnavailableException", "InternalServerException", "ReadTimeoutError", "ConnectTimeoutError", "ConnectionError", "TimeoutError"}
-_NON_RETRYABLE_ERROR_NAMES = {"AccessDeniedException", "ValidationException", "ResourceNotFoundException", "ValueError", "TypeError", "KeyError", "NameError", "SyntaxError"}
+_RETRYABLE_ERROR_NAMES = {"ThrottlingException", "ModelTimeoutException", "ServiceUnavailableException", "InternalServerException", "ConnectTimeoutError", "ConnectionError", "TimeoutError"}
+_NON_RETRYABLE_ERROR_NAMES = {"ReadTimeoutError", "AccessDeniedException", "ValidationException", "ResourceNotFoundException", "ValueError", "TypeError", "KeyError", "NameError", "SyntaxError"}
 _SEMAPHORE_LOCK = threading.Lock()
 _MODEL_SEMAPHORES: dict[str, threading.BoundedSemaphore] = {}
 _TASK_PATH_LOCKS: dict[str, Any] = {}

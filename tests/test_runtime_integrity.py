@@ -8,12 +8,13 @@ from unittest.mock import patch
 
 import pytest
 from langgraph.prebuilt import create_react_agent
+from botocore.exceptions import ConnectTimeoutError, ReadTimeoutError
 from langchain_core.messages import ToolMessage
 
 from core.agent_runtime import CURRENT_EXECUTION, ExecutionSession
 from core.multi_agent.ledger import Task, TaskLedger, STATUS_DONE, STATUS_REVIEW, STATUS_TODO
 from core.multi_agent.orchestrator import ChefDeProjet
-from core.multi_agent.workers import run_single_task, invoke_agent_with_continuation, WorkerResult, _output_from_messages
+from core.multi_agent.workers import run_single_task, invoke_agent_with_continuation, WorkerResult, _output_from_messages, is_retryable_exception
 from tools.custom_tools import WORKSPACE_ROOT, lire_fichier, executer_commande_controlee
 from tools.write_tools import DIRECT_WRITE_TOOLS
 from tests.test_execution_recovery import ScriptedModel, ai, workfile
@@ -198,3 +199,17 @@ _render_task_board(chief)
     assert not app.exception
     assert any(item.value == 'Correction enregistrée' for item in app.markdown)
     assert not any('"blockers"' in item.value for item in app.markdown)
+
+
+def test_ambiguous_read_timeout_is_not_retried_but_connect_timeout_is():
+    assert not is_retryable_exception(ReadTimeoutError(endpoint_url="https://bedrock.invalid"))
+    assert is_retryable_exception(ConnectTimeoutError(endpoint_url="https://bedrock.invalid"))
+
+
+def test_replan_feedback_is_saved_before_model_call():
+    chief = ChefDeProjet()
+    saves = []
+    chief.set_save_callback(lambda: saves.append(True))
+    chief.apply_feedback("Garde les tâches déjà terminées.")
+    assert saves == [True]
+    assert "Garde les tâches déjà terminées." in chief.history[-1][1]

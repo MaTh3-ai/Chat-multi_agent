@@ -90,7 +90,7 @@ def guard_truncated_tool_calls(state: dict[str, Any]) -> dict[str, Any]:
     return {"messages": [replacement]}
 
 CONNECT_TIMEOUT_SECONDS = int(os.getenv("BEDROCK_CONNECT_TIMEOUT", "15"))
-READ_TIMEOUT_SECONDS = int(os.getenv("BEDROCK_READ_TIMEOUT", "300"))
+READ_TIMEOUT_SECONDS = int(os.getenv("BEDROCK_READ_TIMEOUT", "900"))
 # Les workers gerent leur propre retry selectif. Le client ne fait qu'un
 # retry SDK court afin d'eviter la multiplication silencieuse des tentatives.
 SDK_TOTAL_MAX_ATTEMPTS = int(os.getenv("BEDROCK_SDK_TOTAL_MAX_ATTEMPTS", "1"))

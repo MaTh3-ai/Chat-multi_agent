@@ -389,6 +389,9 @@ class ChefDeProjet:
         finally:
             CURRENT_EXECUTION.reset(token)
             self._record_coordination_usage(session.budget)
+            # A timeout may follow a billed request with no usable response.
+            # Persist the user's latest feedback and unknown-usage counter now.
+            self._trigger_save()
 
         text = output.text.strip()
 
@@ -1389,6 +1392,8 @@ Principes :
         self.ledger.set_state(
             STATE_PLANIF
         )
+        # Keep the feedback and prior completed work if the planning call times out.
+        self._trigger_save()
 
     def to_dict(self) -> dict[str, Any]:
         """Sérialise le Chef sans sérialiser le modèle."""

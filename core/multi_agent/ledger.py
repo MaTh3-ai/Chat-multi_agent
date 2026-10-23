@@ -352,7 +352,14 @@ class TaskLedger:
             and ("ok=true" in item.detail.casefold() or "returncode=0" in item.detail.casefold())
             for item in envelope.evidence
         )
+        successful_write = any(
+            item.kind == "file_write"
+            and "applied=true" in item.detail.casefold()
+            for item in envelope.evidence
+        )
         artifact_state = envelope.state
+        if successful_write and STATE_RANK.get(artifact_state, -1) < STATE_RANK["applied"]:
+            artifact_state = "applied"
         if successful_test and artifact_state not in {"proposed", "approved"}:
             artifact_state = "tested"
         task.artifact = Artifact(

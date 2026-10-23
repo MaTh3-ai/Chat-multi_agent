@@ -7,8 +7,8 @@ import threading
 import time
 import hashlib
 from contextlib import ExitStack
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 from langchain_core.messages import ToolMessage, HumanMessage, RemoveMessage
@@ -141,6 +141,7 @@ class WorkerExecutionConfig:
     jitter_seconds: float = JITTER_SECONDS
     budget: RunBudget | None = None
     artifacts: dict[str, str] = field(default_factory=dict)
+    check_paths: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.max_parallel_workers < 1 or self.max_parallel_per_model < 1:
@@ -265,7 +266,7 @@ def invoke_model_with_continuation(model: Any, messages: list[Any], max_continua
     """Invoque un modele simple et recolle automatiquement les suites tronquees."""
     base_messages = list(messages)
     session = CURRENT_EXECUTION.get()
-    call_config = {"callbacks": [UsageRecorder(session.budget, session.run_budget)]} if session else {}
+    call_config = {"callbacks": [UsageRecorder(session.budget, session.run_budget, session.cancel_event)]} if session else {}
     response = model.invoke(base_messages, config=call_config)
     text = extract_text(response, strip=False)
     metrics = _usage_from_response(response)
@@ -327,6 +328,13 @@ def _output_from_messages(state_messages: list[Any]) -> ModelOutput:
                     f"ok={str(bool(payload.get('ok'))).lower()}; "
                     f"returncode={payload.get('returncode')}"
                 )
+            if name == "executer_commande_controlee":
+                for item in payload.get("files", []):
+                    tool_evidence.append({"kind": "file_write", "reference": item["path"],
+                                          "ok": item.get("ok") is True, "applied": True,
+                                          "sequence": sequence, "content_hash": item.get("content_hash"),
+                                          "completed_at_ns": item.get("completed_at_ns", 0),
+                                          "detail": "Modification par commande"})
             if name == "lire_extraits_fichiers":
                 for item in payload.get("files", []):
                     if isinstance(item, dict):
@@ -335,6 +343,9 @@ def _output_from_messages(state_messages: list[Any]) -> ModelOutput:
                                               "content_hash": item.get("content_hash"), "detail": ""})
                 continue
             if name == "appliquer_modifications_directement":
+                if payload.get("ok") is False and not payload.get("files"):
+                    tool_evidence.append({"kind": "file_write", "reference": "lot de modifications",
+                                          "ok": False, "sequence": sequence, "detail": detail})
                 for item in payload.get("files", []):
                     if isinstance(item, dict):
                         tool_evidence.append({"kind": "file_write", "reference": item.get("path", name),
@@ -378,7 +389,7 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
     graph_input: Any = {"messages": list(messages)}
     if session is not None:
         config["configurable"] = {"thread_id": session.key}
-        config["callbacks"] = [UsageRecorder(session.budget, session.run_budget)]
+        config["callbacks"] = [UsageRecorder(session.budget, session.run_budget, session.cancel_event)]
         snapshot = agent.get_state(config)
         if snapshot.values:
             session.messages = snapshot.values.get("messages", [])
@@ -403,21 +414,37 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
                                 session.read_versions[str(path)] = item["content_hash"]
                             except ValueError:
                                 pass
-        if snapshot.values and not snapshot.next:
+        connection = session.connect()
+        connection.execute("CREATE TABLE IF NOT EXISTS execution_context (session TEXT PRIMARY KEY, context TEXT)")
+        previous_context = connection.execute("SELECT context FROM execution_context WHERE session=?", (session.key,)).fetchone()
+        context_changed = bool(snapshot.values and previous_context and previous_context[0] != session.context_update)
+        changed = [path for path, digest in session.read_versions.items()
+                   if not Path(path).is_file() or hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest]
+        if snapshot.values and (changed or context_changed):
+            updates = []
+            last = session.messages[-1] if session.messages else None
+            if getattr(last, "tool_calls", []):
+                updates.append(RemoveMessage(id=last.id))
+            notice = "Reprise : conserve le travail déjà réalisé."
+            if changed:
+                notice += " Relis ces fichiers modifiés avant de poursuivre : " + ", ".join(changed)
+            if context_changed:
+                notice += "\nContexte de coordination actualisé (données) :\n" + session.context_update
+            updates.append(HumanMessage(content=notice))
+            # Advance via the tool node to schedule a fresh model decision.
+            agent.update_state(config, {"messages": updates}, as_node="tools")
+            graph_input = None
+        elif snapshot.values and not snapshot.next:
             last = session.messages[-1]
             if getattr(last, "invalid_tool_calls", []):
                 graph_input = {"messages": [RemoveMessage(id=last.id), HumanMessage(content=
-                    "Le dernier appel d'outil était incomplet et n'a pas été exécuté. "
-                    "Régénère uniquement l'action restante ; les outils précédents ont déjà été appliqués.")]}
-            elif any(not Path(path).is_file() or hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
-                     for path, digest in session.read_versions.items()):
-                graph_input = {"messages": [HumanMessage(content=
-                    "Des fichiers ont changé depuis l'exécution sauvegardée. Relis seulement les zones concernées "
-                    "et termine la tâche sur la version actuelle, sans répéter les changements déjà présents.")]}
+                    "Le dernier appel d'outil était incomplet et n'a pas été exécuté. Régénère seulement l'action restante.")]}
             elif not (complete_result and is_truncated_response(last)):
                 return _output_from_messages(session.messages)
             else:
                 graph_input = {"messages": [HumanMessage(content=CONTINUATION_INSTRUCTION)]}
+        connection.execute("INSERT OR REPLACE INTO execution_context VALUES (?, ?)", (session.key, session.context_update))
+        connection.commit()
     last_state: dict[str, Any] = {}
     for repair in range(max_continuations + 1):
         try:
@@ -594,6 +621,32 @@ def _invoke_reader_agent(model_alias: str, temperature: float | int | None, syst
     )
 
 
+def _invoke_deterministic_command(task: Task, session: ExecutionSession) -> ModelOutput:
+    """A known control command requires no model decision or generated report."""
+    from tools.custom_tools import executer_commande_controlee, IGNORED_DIRECTORY_NAMES
+    from core.agent_runtime import snapshot_files
+    connection = session.connect()
+    connection.execute("CREATE TABLE IF NOT EXISTS control_runs (session TEXT PRIMARY KEY, result TEXT)")
+    row = connection.execute("SELECT result FROM control_runs WHERE session=?", (session.key,)).fetchone()
+    if row and row[0] is None:
+        raise RuntimeError("Commande interrompue : effets incertains, vérifier avant de relancer.")
+    payload = json.loads(row[0]) if row else None
+    current = snapshot_files(WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES)
+    if payload is None or payload.get("checked_files") != current:
+        connection.execute("INSERT OR REPLACE INTO control_runs VALUES (?, NULL)", (session.key,))
+        connection.commit()
+        payload = json.loads(executer_commande_controlee.invoke({"commande": task.command}))
+        connection.execute("UPDATE control_runs SET result=? WHERE session=?", (json.dumps(payload), session.key))
+        connection.commit()
+    blockers = [] if payload.get("ok") else [payload.get("error") or "Le contrôle a échoué ; consulter sa sortie."]
+    session.messages = [ToolMessage(name="executer_commande_controlee", tool_call_id="control",
+                                   content=json.dumps(payload))]
+    output = _output_from_messages(session.messages)
+    output.text = json.dumps({"summary": "Contrôle réussi." if not blockers else "Contrôle non abouti.",
+                              "blockers": blockers}, ensure_ascii=False)
+    return output
+
+
 def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig | None = None, cancel_event: threading.Event | None = None, progress: ProgressCallback | None = None) -> WorkerResult:
     config = config or WorkerExecutionConfig()
     started = time.time()
@@ -612,12 +665,28 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
 
     semaphore = _model_semaphore(result.model_alias, min(config.max_parallel_per_model, tier_conf.get("max_parallel", 1)))
     fingerprint = hashlib.sha256(json.dumps([task.title, task.description, task.acceptance_criteria,
-                                             task.expected_output, result.model_alias, context,
-                                             {key: value for key, value in config.artifacts.items() if key in task.dependencies}],
+                                             task.expected_output, result.model_alias, task.capabilities, task.command],
                                             ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
     session = ExecutionSession(key=f"{task.execution_id}:{fingerprint}",
-                               root=PROJECT_ROOT / ".agent_state", run_budget=config.budget,
+                               root=PROJECT_ROOT / ".agent_state", run_budget=config.budget, cancel_event=cancel_event,
+                               context_update=context, check_paths=set(config.check_paths),
                                artifacts={key: value for key, value in config.artifacts.items() if key in task.dependencies})
+    legacy = hashlib.sha256(json.dumps([task.title, task.description, task.acceptance_criteria,
+                                        task.expected_output, result.model_alias, context,
+                                        {key: value for key, value in config.artifacts.items() if key in task.dependencies}],
+                                       ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+    connection = session.connect()
+    connection.execute("CREATE TABLE IF NOT EXISTS session_aliases (identity TEXT PRIMARY KEY, thread TEXT)")
+    alias = connection.execute("SELECT thread FROM session_aliases WHERE identity=?", (session.key,)).fetchone()
+    identity = session.key
+    if alias:
+        session.key = alias[0]
+    elif connection.execute("SELECT 1 FROM sqlite_master WHERE name='checkpoints'").fetchone():
+        legacy_key = f"{task.execution_id}:{legacy}"
+        if connection.execute("SELECT 1 FROM checkpoints WHERE thread_id=? LIMIT 1", (legacy_key,)).fetchone():
+            session.key = legacy_key
+    connection.execute("INSERT OR IGNORE INTO session_aliases VALUES (?, ?)", (identity, session.key))
+    connection.commit()
     runtime_token = CURRENT_EXECUTION.set(session)
     _emit(progress, "worker", f"{task.title} : en attente d'un creneau {result.model_alias}.", task.id)
     max_attempts = min(
@@ -670,7 +739,11 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                     task.id,
                 )
 
-                if mode == "edition":
+                if task.command:
+                    if task.capabilities != ["execute"]:
+                        raise ValueError("Une commande déterministe exige la capacité execute seule.")
+                    output = _invoke_deterministic_command(task, session)
+                elif mode == "edition":
                     output = _invoke_editor_agent(result.model_alias, temperature, system_prompt, task_prompt)
                 elif mode == "lecture":
                     output = _invoke_reader_agent(result.model_alias, temperature, system_prompt, task_prompt)
@@ -784,61 +857,80 @@ def build_context(ledger: TaskLedger, task: Task, discovery_context: str = "") -
     return compile_context(ledger, task, discovery_context)
 
 
-def run_tasks_parallel(ledger: TaskLedger, tasks: list[Task], max_workers: int = MAX_PARALLEL_WORKERS, config: WorkerExecutionConfig | None = None, cancel_event: threading.Event | None = None, discovery_context: str = "", progress: ProgressCallback | None = None) -> list[WorkerResult]:
+def run_tasks_parallel(ledger: TaskLedger, tasks: list[Task], max_workers: int = MAX_PARALLEL_WORKERS,
+                       config: WorkerExecutionConfig | None = None, cancel_event: threading.Event | None = None,
+                       discovery_context: str = "", progress: ProgressCallback | None = None,
+                       drain_ready: bool = False, on_result: Callable[[], None] | None = None) -> list[WorkerResult]:
+    """Bounded scheduler; only this thread updates the ledger.
+
+    Compatibility mode returns one batch. drain_ready applies results immediately
+    and admits newly ready dependencies without waiting for unrelated workers.
+    """
     if not tasks or ledger.cancel_requested:
         return []
     config = config or WorkerExecutionConfig(max_parallel_workers=max_workers)
-    config.artifacts.update({task.id: task.artifact.result or task.deliverable or ""
-                             for task in ledger.tasks if task.artifact})
     cancel_event = cancel_event or threading.Event()
-    prepared: list[tuple[Task, str]] = []
-    for task in tasks:
-        if task not in ledger.ready_tasks():
-            raise ValueError(f"La tache {task.id} n'est pas prete a etre executee.")
-        attempt = ledger.begin_task(task.id)
-        task.input_revision = workspace_revision()
-        ledger.log_event("task_started", f"Debut de {task.title}.", task_id=task.id, attempt=attempt)
-        prepared.append((task, build_context(ledger, task, discovery_context)))
-    results: list[WorkerResult] = []
-    workers = max(1, min(config.max_parallel_workers, len(prepared)))
-    order = {task.id: index for index, (task, _) in enumerate(prepared)}
-    _emit(
-        progress,
-        "state",
-        f"Vague de {len(prepared)} tache(s), {workers} worker(s) en parallele.",
-    )
+    if any(task not in ledger.ready_tasks() for task in tasks):
+        raise ValueError("Une tâche n'est pas prête à être exécutée.")
+    initial_ids = {task.id for task in tasks}
+    submitted = set()
+    active_paths: set[str] = set()
+    results = []
+    workers = max(1, config.max_parallel_workers)
+
+    def execute_owned(task, context, task_config, paths):
+        with _SEMAPHORE_LOCK:
+            locks = [_TASK_PATH_LOCKS.setdefault(path, threading.Lock()) for path in paths]
+        with ExitStack() as stack:
+            for lock in locks:
+                stack.enter_context(lock)
+            task.input_revision = workspace_revision()
+            result = run_single_task(task, context, task_config, cancel_event, progress)
+            result.input_revision = task.input_revision
+            result.output_revision = workspace_revision()
+            return result
+
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ma-worker") as pool:
-        def execute_owned(task: Task, context: str) -> WorkerResult:
-            # These scheduling locks are separate from tool locks: LangGraph
-            # tools run on child threads, so sharing an RLock would deadlock.
-            paths = task_paths(task) if _task_requires_writing(task) or {"write", "propose_write"} & set(task.capabilities) else []
-            with _SEMAPHORE_LOCK:
-                locks = [_TASK_PATH_LOCKS.setdefault(path, threading.Lock()) for path in paths]
-            with ExitStack() as stack:
-                for lock in locks:
-                    stack.enter_context(lock)
-                task.input_revision = workspace_revision()
-                return run_single_task(task, context, config, cancel_event, progress)
-        futures = {pool.submit(execute_owned, task, context): task for task, context in prepared}
-        completed = 0
-        for future in as_completed(futures):
-            task = futures[future]
-            try:
-                worker_result = future.result()
-                worker_result.input_revision = task.input_revision
-                worker_result.output_revision = workspace_revision()
-                results.append(worker_result)
-            except Exception as exc:
-                results.append(WorkerResult(task_id=task.id, tier=task.assigned_tier, error=f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__))
-            completed += 1
-            _emit(
-                progress,
-                "state",
-                f"Avancement de la vague : {completed}/{len(prepared)} tache(s) terminee(s).",
-                task.id,
-            )
-    results.sort(key=lambda result: order[result.task_id])
-    return results
+        futures = {}
+        while True:
+            if not cancel_event.is_set() and not ledger.cancel_requested:
+                ledger.sync_artifact_states()
+                for task in ledger.ready_tasks():
+                    if len(futures) >= workers:
+                        break
+                    if task.id in submitted or (not drain_ready and task.id not in initial_ids):
+                        continue
+                    paths = sorted(str(resolve_workspace_path(path)) for path in task_paths(task))
+                    if active_paths.intersection(paths):
+                        continue
+                    artifacts = {dep.id: dep.artifact.result or dep.deliverable or ""
+                                 for dep in ledger.tasks if dep.artifact and dep.id in task.dependencies}
+                    task_config = replace(config, artifacts=artifacts)
+                    context = build_context(ledger, task, discovery_context)
+                    attempt = ledger.begin_task(task.id)
+                    ledger.log_event("task_started", f"Début de {task.title}.", task_id=task.id, attempt=attempt)
+                    submitted.add(task.id)
+                    active_paths.update(paths)
+                    futures[pool.submit(execute_owned, task, context, task_config, paths)] = (task, paths)
+            if not futures:
+                break
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                task, paths = futures.pop(future)
+                active_paths.difference_update(paths)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = WorkerResult(task_id=task.id, tier=task.assigned_tier,
+                                          error=f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)
+                results.append(result)
+                if drain_ready:
+                    apply_results(ledger, [result])
+                    if on_result:
+                        on_result()
+                _emit(progress, "state", f"Tâche achevée : {task.title}.", task.id)
+    order = {task.id: i for i, task in enumerate(ledger.tasks)}
+    return sorted(results, key=lambda result: order[result.task_id])
 
 
 def apply_results(ledger: TaskLedger, results: list[WorkerResult]) -> None:

@@ -99,6 +99,7 @@ class Task:
     expected_output: str = ""
     execution_id: str = field(default_factory=lambda: uuid4().hex)
     capabilities: list[str] = field(default_factory=list)
+    command: list[str] = field(default_factory=list)
     max_retries: int = 1
     max_escalations: int = 1
     # Revue croisee : quand requires_review vaut True, le livrable est soumis
@@ -302,11 +303,10 @@ class TaskLedger:
         """Réconcilie les artefacts proposés avec l'état réel des propositions."""
         for task in self.tasks:
             artifact = task.artifact
-            if artifact and artifact.tested and any(
+            if artifact and artifact.tested and (not artifact.validation_files or any(
                 file_content_hash(path) != digest
-                for item in artifact.evidence if item.source == "tool" and item.kind == "test"
-                for path, digest in item.checked_files.items()
-            ):
+                for path, digest in artifact.validation_files.items()
+            )):
                 artifact.tested = False
                 artifact.state = "applied" if any(item.applied for item in artifact.evidence) else "observed"
         proposal_ids = [
@@ -397,6 +397,7 @@ class TaskLedger:
                             item.started_at_ns >= last_write_time if last_write_time else item.sequence > last_write)}
         successful_test = bool(latest_tests) and all(
             item.ok is True
+            and bool(item.checked_files)
             and (not last_write_time or item.started_at_ns >= last_write_time)
             and all(write.reference in item.checked_files for write in writes)
             and all(file_content_hash(path) == digest for path, digest in item.checked_files.items())
@@ -421,6 +422,8 @@ class TaskLedger:
             input_revision=task.input_revision,
             output_revision=task.output_revision,
             tested=successful_test,
+            validation_files={path: digest for test in latest_tests.values()
+                              for path, digest in test.checked_files.items()} if successful_test else {},
             claims=envelope.claims,
             result=envelope.result,
             blockers=envelope.blockers,
@@ -441,7 +444,13 @@ class TaskLedger:
             task.attempts[-1].status = STATUS_DONE
             task.attempts[-1].completed_at = utc_now_iso()
             task.attempts[-1].latency_ms = task.metrics.latency_ms
-        self.set_status(task_id, STATUS_REVIEW if envelope.blockers else STATUS_DONE)
+        # Only unresolved failures matter; a successful later write to the
+        # same file resolves an earlier failed attempt without another review.
+        latest_writes = {item.reference: item for item in actual if item.kind == "file_write"}
+        unresolved = [item.reference for item in latest_writes.values() if item.ok is not True]
+        if unresolved:
+            task.artifact.blockers.append("Écriture non aboutie : " + ", ".join(unresolved))
+        self.set_status(task_id, STATUS_REVIEW if task.artifact.blockers else STATUS_DONE)
         self.refresh_blocked_tasks()
 
     def _detect_claim_contradictions(self, current_task: Task) -> None:
@@ -509,6 +518,18 @@ class TaskLedger:
             attempt.latency_ms = task.metrics.latency_ms
         self.set_status(task_id, STATUS_FAILED)
         self.refresh_blocked_tasks()
+
+    def recover_interrupted_tasks(self) -> list[str]:
+        """Only call after restoring a run, when no previous worker is alive."""
+        recovered = []
+        for task in self.tasks:
+            if task.status == STATUS_DOING:
+                task.status = STATUS_TODO
+                recovered.append(task.id)
+                if task.attempts:
+                    task.attempts[-1].status = STATUS_CANCELLED
+                    task.attempts[-1].completed_at = utc_now_iso()
+        return recovered
 
     def retry_task(self, task_id: str) -> None:
         if self.cancel_requested:

@@ -110,6 +110,10 @@ CONTRAINTES SÉMANTIQUES
   lecture, write pour modifier directement le workspace avec les outils
   dédiés, et generate pour une réponse sans outil. auto est acceptable si le
   mode est évident ;
+- Pour un contrôle mécanique dont la commande exacte est connue, ajoute le champ
+  optionnel command (liste d’arguments, sans shell) et capabilities=["execute"].
+  Le runtime le lance sans worker LLM. Omet ce champ si un diagnostic, un choix
+  de commande ou une interprétation approfondie sont nécessaires.
 - max_retries vaut 0, 1 ou 2 (défaut 1). Il borne les reprises réseau ;
   ne prévois aucune boucle supplémentaire de relance de la tâche ;
 - depends_on contient uniquement des indices entiers de base 0 pointant vers

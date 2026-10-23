@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
-from core.agent_runtime import CURRENT_EXECUTION, path_lock
+from core.agent_runtime import CURRENT_EXECUTION, path_lock, workspace_mutation
 
 from tools.custom_tools import (
     ALLOWED_TEXT_EXTENSIONS,
@@ -1511,6 +1511,7 @@ def clear_resolved_proposals() -> None:
 # Ecriture directe réservée aux workers du mode multi-agent
 # -------------------------------------------------------------------
 
+@workspace_mutation
 def _apply_direct_change(tool_object: Any, arguments: dict[str, Any]) -> str:
     """Valide, sauvegarde et applique une écriture sans étape d'approbation UI."""
     path = resolve_workspace_path(str(arguments.get("chemin", "")))
@@ -1527,6 +1528,7 @@ def _apply_direct_change(tool_object: Any, arguments: dict[str, Any]) -> str:
                 return json.dumps({"ok": False, "applied": False, "path": arguments["chemin"],
                                    "error": "Fichier modifié depuis la lecture ; relire la zone avant de réessayer."}, ensure_ascii=False)
         result = json.loads(_apply_direct_change_unlocked(tool_object, arguments))
+        result.setdefault("path", str(arguments.get("chemin", "")))
         if result.get("applied") is True:
             result["content_hash"] = hashlib.sha256(path.read_bytes()).hexdigest()
             result["completed_at_ns"] = time.time_ns()
@@ -1658,6 +1660,7 @@ def supprimer_bloc_directement(
 
 
 @tool
+@workspace_mutation
 def appliquer_modifications_directement(modifications: list[dict[str, str]]) -> str:
     """Applique ensemble des changements liés sur plusieurs fichiers.
 
@@ -1709,7 +1712,7 @@ def appliquer_modifications_directement(modifications: list[dict[str, str]]) -> 
                     reject_proposal(proposal_id)
                 except FileModificationError:
                     pass
-            return json.dumps({"ok": False, "files": [], "error": str(error)}, ensure_ascii=False)
+            return json.dumps({"ok": False, "files": [{"path": item["chemin"], "ok": False, "applied": False} for item in modifications], "error": str(error)}, ensure_ascii=False)
         files = []
         for path, item, result in zip(paths, modifications, results):
             record = {"ok": True, "applied": True, "path": item["chemin"],

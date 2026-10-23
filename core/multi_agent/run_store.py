@@ -240,7 +240,9 @@ def load_run(run_id: str) -> TaskLedger | None:
         )
     
     try:
-        return TaskLedger.from_dict(data["ledger"])
+        ledger = TaskLedger.from_dict(data["ledger"])
+        ledger.recover_interrupted_tasks()
+        return ledger
     except (TypeError, ValueError, KeyError) as error:
         raise RunStoreError(
             f"Chantier {run_id} incompatible avec le schéma actuel : {error}. "

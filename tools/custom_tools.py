@@ -16,7 +16,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from core.command_journal import record_command
-from core.agent_runtime import CURRENT_EXECUTION, command_category, path_lock
+from core.agent_runtime import CURRENT_EXECUTION, command_category, path_lock, workspace_mutation, snapshot_files
 
 
 # -------------------------------------------------------------------
@@ -886,6 +886,7 @@ def rechercher_dans_fichiers(
 
 
 @tool
+@workspace_mutation
 def executer_commande_controlee(
     commande: list[str],
     dossier: str = ".",
@@ -911,15 +912,8 @@ def executer_commande_controlee(
     started = time.monotonic()
     started_at_ns = time.time_ns()
     session = CURRENT_EXECUTION.get()
-    before = {}
-    if session:
-        import hashlib
-        with session._lock:
-            previous_paths = list(session.writes)
-        for relative in previous_paths:
-            path = resolve_workspace_path(relative)
-            if path.is_file():
-                before[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    before = snapshot_files(WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES) if session else {}
+    failure = None
     try:
         working_directory = resolve_workspace_path(dossier)
         if not working_directory.is_dir():
@@ -944,7 +938,8 @@ def executer_commande_controlee(
             error=message,
             duration_seconds=time.monotonic() - started,
         )
-        return json.dumps({"ok": False, "error": message}, ensure_ascii=False)
+        failure = message
+        completed = subprocess.CompletedProcess(commande, -1, "", message)
     stdout = (completed.stdout or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
     stderr = (completed.stderr or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
     record_command(
@@ -955,16 +950,22 @@ def executer_commande_controlee(
         stderr=stderr,
         duration_seconds=time.monotonic() - started,
     )
-    session = CURRENT_EXECUTION.get()
-    checked_files = {}
+    after = snapshot_files(WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES) if session else {}
+    changed_files = []
     if session:
-        import hashlib
-        with session._lock:
-            written_paths = list(session.writes)
-        for relative in written_paths:
-            path = resolve_workspace_path(relative)
-            if path.is_file():
-                checked_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        for relative in sorted(before.keys() | after.keys()):
+            if before.get(relative) == after.get(relative):
+                continue
+            record = {"ok": True, "applied": True, "path": relative,
+                      "content_hash": after.get(relative), "deleted": relative not in after,
+                      "completed_at_ns": time.time_ns(), "via": "command"}
+            session.record_write(session.operation_key("command_effect", {"command": commande, "record": record}), record)
+            if relative in after:
+                session.read_versions[str(resolve_workspace_path(relative))] = after[relative]
+            changed_files.append(record)
+    # A separate testing worker validates project inputs, not only its own
+    # writes. Include configuration, test files and newly created sources.
+    checked_files = after if session and before == after else {}
     return json.dumps({
         "ok": completed.returncode == 0,
         "returncode": completed.returncode,
@@ -973,7 +974,10 @@ def executer_commande_controlee(
         "checked_files": checked_files,
         "started_at_ns": started_at_ns,
         "completed_at_ns": time.time_ns(),
-        "stable_during_check": before == checked_files,
+        "stable_during_check": before == after,
+        "files": changed_files,
+        "error": failure,
+        "effects_uncertain": bool(failure),
         "cwd": get_relative_path(working_directory),
         "stdout": stdout,
         "stderr": stderr,

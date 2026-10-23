@@ -584,3 +584,44 @@ la synthèse lorsqu’elle est nécessaire. Les reprises sont cumulées ; les to
 lus/écrits en cache sont distingués. Les appels interrompus dont la consommation
 est inconnue sont signalés : leur coût n’est pas présenté comme nul. Aucune
 réduction chiffrée de facture n’est supposée sans mesure sur des tâches réelles.
+
+## Fiabilité et parcours simplifié (troisième itération)
+
+- Une écriture échouée non suivie d'une écriture réussie sur le même chemin
+  laisse un blocage explicite. Les contrôles facultatifs absents ne bloquent pas.
+- La synchronisation conserve les empreintes des derniers contrôles retenus,
+  sans invalider leur succès à cause d'un ancien test. Une commande sans
+  périmètre observé ne certifie pas des fichiers.
+- Les commandes observent les créations, modifications et suppressions dans le
+  workspace, même en cas de code retour non nul. Un inventaire de contenu avant
+  et après permet aux workers de contrôle de couvrir les sources des autres
+  tâches. Les répertoires ignorés sont exclus ; les effets externes et les
+  changements externes transitoires restent hors garantie. Cet inventaire peut
+  coûter des E/S sur un grand projet. Les fenêtres de mutation sont sérialisées
+  dans le processus ; le raisonnement des agents reste parallèle.
+- Les empreintes de contrôle restent dans les preuves persistées ; elles sont
+  retirées du contexte envoyé au modèle pour éviter de payer leur relecture.
+- L'identité du checkpoint dépend du contrat, du modèle et des capacités, pas
+  du contexte de coordination. Un changement de contexte ajoute une instruction
+  à la session existante. Les lectures périmées sont signalées aussi pour les
+  graphes interrompus ; une ancienne action en attente doit être redécidée.
+  Les anciens identifiants de checkpoints sont repris lorsqu'ils sont retrouvés.
+- L'arrêt coopératif empêche la prochaine inférence sans couper celle déjà payée.
+  Au chargement d'un chantier, les tâches orphelines « en cours » redeviennent
+  reprenables avec la même identité d'exécution.
+- Le scheduler applique chaque résultat dès sa réception et débloque ses
+  dépendances sans attendre les tâches indépendantes. Les tâches mentionnant
+  un même fichier sont sérialisées et les limites par modèle sont conservées.
+- L'entrée principale demande au chef soit une clarification indispensable, soit
+  directement un plan. Le plan reste consultable et modifiable avant exécution.
+- Un plan peut fournir `command: ["python", "-m", "pytest"]` avec la seule
+  capacité `execute`. Ce contrôle explicite est exécuté sans worker LLM ; une
+  commande interrompue dont le résultat n'a pas été enregistré n'est pas rejouée
+  aveuglément. Le résultat d'un contrôle inchangé peut être réutilisé. Un travail
+  nécessitant choix ou diagnostic conserve un worker ordinaire.
+- L'interface présente les résumés et blocages, une progression basée sur les
+  tâches terminées, et réserve modèles, preuves JSON et journaux aux détails.
+
+Validation locale : 61 tests sans appels fournisseur, dont reprise, arrêt,
+preuves de contrôle, effets des commandes, scheduler et rendu Streamlit.
+Aucun gain de facture Bedrock n'est annoncé sans mesure sur des tâches réelles.

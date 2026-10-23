@@ -406,25 +406,25 @@ def _job_monitor_body() -> None:
         st.warning(f"{header} — interruption demandee, arret apres l'etape en cours.")
     elif job.is_running():
         st.info(f"{header}")
+    elif job.status == JOB_STATUS_ERROR:
+        st.error("Exécution interrompue par une erreur ; le travail enregistré est conservé.")
+    elif job.status == JOB_STATUS_CANCELLED:
+        st.warning("Exécution suspendue ; le travail enregistré est conservé.")
     else:
-        st.success(f"Operation « {job.operation} » terminee en {elapsed:.0f}s.")
+        st.success(f"Opération terminée en {elapsed:.0f}s.")
 
-    if job.is_running():
-        st.progress(_pulse_value(elapsed), text="Traitement en arriere-plan")
-
-    _render_status_recap(chief)
-    _render_live_tasks(chief)
-
-    st.markdown("##### Journal en direct")
-    if not events:
-        st.caption("En attente du premier evenement...")
-    else:
-        # Les plus récents en tête : l'information utile est la dernière.
+    tasks = chief.ledger.tasks
+    if tasks:
+        completed = sum(task.status == STATUS_DONE for task in tasks)
+        st.progress(completed / len(tasks), text=f"{completed} / {len(tasks)} tâches terminées")
+        _render_live_tasks(chief)
+    elif job.is_running():
+        st.caption("Analyse en cours…")
+    if events:
+        st.caption(events[-1].message)
+    with st.expander("Détails de l’exécution", expanded=False):
         for event in reversed(events[-_MONITOR_VISIBLE_EVENTS:]):
-            icon = _EVENT_ICON.get(event.kind, "•")
-            st.caption(f"{icon} {event.message}")
-        if len(events) > _MONITOR_VISIBLE_EVENTS:
-            st.caption(f"... et {len(events) - _MONITOR_VISIBLE_EVENTS} evenement(s) plus ancien(s).")
+            st.caption(event.message)
 
     if job.is_running() and not job.cancel_event.is_set():
         if st.button("Interrompre l'operation", key="ma_cancel_job"):
@@ -448,11 +448,9 @@ def _render_live_tasks(chief) -> None:
         return
     rows = [
         {
-            "Agent": task.id,
+            "Tâche": task.title,
             "Etat": f"{_STATUS_ICON.get(task.status, '❔')} {_STATUS_LABEL.get(task.status, task.status)}",
-            "Tache": task.title,
-            "Tier": task.assigned_tier,
-            "Tokens": getattr(getattr(task, "metrics", None), "total_tokens", None) or 0,
+
         }
         for task in tasks
     ]
@@ -527,6 +525,7 @@ def _get_chief():
 def _restore_chief_from_ledger(ledger: "TaskLedger") -> None:
     """Restaure un ChefDeProjet depuis un TaskLedger chargé."""
     chief = new_chief()
+    ledger.recover_interrupted_tasks()
     chief.ledger = ledger
     # Restaurer chief_history depuis le ledger
     chief.history = list(ledger.chief_history) if hasattr(ledger, "chief_history") else []
@@ -644,7 +643,7 @@ def _phase_discovery(chief) -> None:
         else:
             st.error("Découverte invalide : aucun contenu de fichier vérifiable.")
         
-        with st.expander("Détails de la découverte", expanded=True):
+        with st.expander("Détails de la découverte", expanded=False):
             if report.workspace_info:
                 st.markdown("**Informations workspace**")
                 st.code(report.workspace_info, language="text")
@@ -734,8 +733,8 @@ def _phase_interview(chief) -> None:
                         f"Découverte ignorée pour l'entretien : {type(error).__name__}.",
                     )
             job.emit("state", "Le Chef analyse la demande et le contexte du projet...")
-            chief.interview(prompt)
-            return {}
+            report = chief.prepare_request(prompt)
+            return {"plan_report": report, "state": STATE_PLANIF} if report else {}
 
         _start_background_job(chief, "interview", _run_interview)
 
@@ -780,12 +779,9 @@ def _phase_planif(chief) -> None:
     st.subheader("Plan propose")
     if report is not None:
         st.caption(f"{report.task_count} tache(s), repartition : {report.tiers_used}")
-        st.metric(
-            "Budget maximal estimé",
-            f"{estimate_plan_cost(chief.ledger)} unités relatives",
-            help="Estimation conservative : exécution initiale + retries + escalades "
-            "et revue éventuelle. Ce n'est pas un prix AWS.",
-        )
+        with st.expander("Estimation et répartition des modèles", expanded=False):
+            st.caption(f"Indice relatif : {estimate_plan_cost(chief.ledger)}. Ce n’est ni un prix ni un plafond de facturation.")
+            _render_team_structure(chief)
         assumptions = getattr(report, "assumptions", [])
         if assumptions:
             with st.expander("Hypotheses de planification", expanded=True):
@@ -796,7 +792,6 @@ def _phase_planif(chief) -> None:
         for warning in getattr(report, "validation_warnings", []):
             st.info(warning)
 
-    _render_team_structure(chief)
     _render_task_board(chief)
     
     # Composant de prévisualisation et d'édition du plan
@@ -876,10 +871,9 @@ def _phase_review(chief) -> None:
                 st.markdown(f"**{task.title}** — {reason}")
         if barrier_blocked:
             st.info(
-                "Une barrière d'état retient ces tâches : l'artefact dont elles "
-                "dépendent est proposé mais pas encore appliqué. Valide les "
-                "propositions correspondantes, ou lève la barrière pour avancer "
-                "sans attendre."
+                "Ces tâches attendent une modification ou un contrôle validé. "
+                "Consulte le motif ci-dessus. Lever cette condition permet "
+                "de poursuivre sans cette garantie."
             )
             if st.button(
                 f"Lever les barrières et reprendre ({len(barrier_blocked)})",
@@ -1167,7 +1161,7 @@ def _render_task_board(chief) -> None:
     for task in chief.ledger.tasks:
         icon = _STATUS_ICON.get(task.status, "❔")
         label = _STATUS_LABEL.get(task.status, f"Etat inconnu : {task.status}")
-        header = f"{icon} {task.title} | {label} | {task.assigned_tier}"
+        header = f"{icon} {task.title} — {label}"
         with st.expander(header, expanded=task.status in {STATUS_FAILED, STATUS_BLOCKED}):
             st.caption(task.description)
             if task.dependencies:
@@ -1175,16 +1169,16 @@ def _render_task_board(chief) -> None:
             role = getattr(task, "assigned_role", None)
             if role:
                 st.caption(f"Role : {role}")
-            if task.deliverable:
-                st.markdown("##### Livrable")
-                st.markdown(task.deliverable)
             artifact = getattr(task, "artifact", None)
             if artifact:
-                st.caption(
-                    f"Artefact : {artifact.state} | "
-                    f"révision entrée {task.input_revision[:12] or '—'} | "
-                    f"sortie {task.output_revision[:12] or '—'}"
-                )
+                st.markdown(artifact.result or artifact.summary)
+                labels = {"observed": "Résultat produit", "applied": "Modifications enregistrées · contrôles non validés",
+                          "tested": "Contrôles réussis sur la version observée", "proposed": "Modifications proposées"}
+                st.caption(labels.get(artifact.state, artifact.state))
+                for blocker in artifact.blockers:
+                    st.warning(blocker)
+            elif task.deliverable:
+                st.markdown(task.deliverable)
             error = getattr(task, "error", None)
             if error:
                 st.error(error)
@@ -1192,15 +1186,14 @@ def _render_task_board(chief) -> None:
             if notes:
                 with st.expander("Notes techniques", expanded=False):
                     st.code(notes)
-            metrics = getattr(task, "metrics", None)
-            if metrics:
-                st.caption(
-                    f"Tentatives : {getattr(task, 'attempt_count', 0)} | "
-                    f"Latence : {getattr(metrics, 'latency_ms', None) or 0:.0f} ms | "
-                    f"Tokens : {getattr(metrics, 'total_tokens', None) or 0} | "
-                    f"Répétition : {getattr(metrics, 'repetition_ratio', 0.0):.1%} | "
-                    f"Fichiers lus : {getattr(metrics, 'files_read', 0)}"
-                )
+            with st.expander("Informations techniques", expanded=False):
+                st.caption(f"Modèle : {task.assigned_tier} · Tentatives : {task.attempt_count}")
+                st.caption(f"Appels : {task.metrics.model_calls} · Tokens connus : {task.metrics.total_tokens or 0}")
+                if task.command:
+                    st.code(" ".join(task.command))
+                if artifact:
+                    st.json({"references": artifact.references,
+                             "evidence": [vars(item) for item in artifact.evidence]})
 
 
 def _render_events(chief) -> None:

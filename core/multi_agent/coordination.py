@@ -55,6 +55,7 @@ class Artifact:
     input_revision: str = ""
     output_revision: str = ""
     tested: bool = False
+    validation_files: dict[str, str] = field(default_factory=dict)
     claims: list[dict[str, str]] = field(default_factory=list)
     result: str = ""
     blockers: list[str] = field(default_factory=list)

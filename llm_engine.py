@@ -57,6 +57,19 @@ def compact_duplicate_tool_results(state: dict[str, Any]) -> dict[str, Any]:
             }, ensure_ascii=False)})
         else:
             seen[key] = message.tool_call_id
+    # Runtime proofs stay in checkpoints/ledger, not in paid model context.
+    for index, message in enumerate(messages):
+        if not isinstance(message, ToolMessage) or message.name != "executer_commande_controlee":
+            continue
+        try:
+            payload = json.loads(message.content)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and "checked_files" in payload:
+            payload["scope_file_count"] = len(payload.pop("checked_files"))
+            payload.pop("started_at_ns", None)
+            payload.pop("completed_at_ns", None)
+            messages[index] = message.model_copy(update={"content": json.dumps(payload, ensure_ascii=False)})
     return {"llm_input_messages": messages}
 
 

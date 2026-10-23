@@ -361,6 +361,12 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
             requires_review = False
         review_count += int(requires_review)
 
+        command = raw_task.get("command", [])
+        if not isinstance(command, list) or any(not isinstance(part, str) or not part.strip() for part in command):
+            raise PlanError(f"{where}: command doit être une liste d'arguments.")
+        if command and capabilities != ["execute"]:
+            raise PlanError(f"{where}: command exige capabilities=[execute].", semantic=True)
+
         ledger.add_task(
             Task(
                 id=identifiers[index],
@@ -370,6 +376,7 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
                 acceptance_criteria=criteria,
                 assigned_tier=tier,
                 capabilities=capabilities,
+                command=command,
                 max_retries=max_retries,
                 max_escalations=max_escalations,
                 requires_review=requires_review,

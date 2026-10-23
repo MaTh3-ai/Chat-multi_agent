@@ -9,12 +9,17 @@ import json
 import os
 import sqlite3
 import threading
+from functools import wraps
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from langchain_core.callbacks import BaseCallbackHandler
+
+
+class ExecutionCancelled(RuntimeError):
+    """Cooperative pause before the next paid inference."""
 
 
 class ExecutionBudgetExceeded(RuntimeError):
@@ -61,11 +66,14 @@ class UsageRecorder(BaseCallbackHandler):
     """Actual successful usage plus attempted calls, including failed attempts."""
     raise_error = True
 
-    def __init__(self, budget: RunBudget, parent: RunBudget | None = None):
+    def __init__(self, budget: RunBudget, parent: RunBudget | None = None, cancel_event=None):
         self.budget = budget
         self.parent = parent
+        self.cancel_event = cancel_event
 
     def on_chat_model_start(self, serialized: Any, messages: Any, **kwargs: Any) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise ExecutionCancelled("Exécution suspendue ; travail conservé.")
         if self.parent is not None:
             self.parent.begin_call()
         self.budget.begin_call()
@@ -88,7 +96,7 @@ class UsageRecorder(BaseCallbackHandler):
 
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
         # A timeout is not proof that the provider did not bill the call.
-        if isinstance(error, ExecutionBudgetExceeded):
+        if isinstance(error, (ExecutionBudgetExceeded, ExecutionCancelled)):
             return
         for budget in [self.budget] + ([self.parent] if self.parent is not None else []):
             with budget._lock:
@@ -102,6 +110,9 @@ class ExecutionSession:
     budget: RunBudget = field(default_factory=RunBudget)
     run_budget: RunBudget | None = None
     artifacts: dict[str, str] = field(default_factory=dict)
+    cancel_event: Any = None
+    context_update: str = ""
+    check_paths: set[str] = field(default_factory=set)
     agent: Any = None
     messages: list[Any] = field(default_factory=list)
     read_versions: dict[str, str] = field(default_factory=dict)
@@ -201,3 +212,38 @@ def command_category(command: list[str]) -> str:
     if executable in {"py_compile", "compileall", "tsc"}:
         return "syntax"
     return "command"
+
+
+# Commands may edit any project file. Serialize mutation windows, while model
+# inference and read-only work remain parallel. RLock permits batch wrappers.
+WORKSPACE_MUTATION_LOCK = threading.RLock()
+
+
+def workspace_mutation(function):
+    @wraps(function)
+    def locked(*args, **kwargs):
+        with WORKSPACE_MUTATION_LOCK:
+            return function(*args, **kwargs)
+    return locked
+
+
+def snapshot_files(root: Path, ignored: set[str]) -> dict[str, str]:
+    """Content snapshot; prune ignored trees before visiting their children."""
+    result = {}
+    for directory, directories, files in os.walk(root):
+        directories[:] = [name for name in directories if name not in ignored
+                          and not (Path(directory) / name).is_symlink()]
+        for name in files:
+            path = Path(directory) / name
+            if path.is_symlink():
+                continue
+            try:
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                result[path.relative_to(root).as_posix()] = digest.hexdigest()
+            except OSError:
+                # Do not certify a partially observed workspace.
+                raise RuntimeError(f"Impossible d'observer {path}")
+    return result

@@ -1058,20 +1058,28 @@ def _render_run_summary(chief) -> None:
         columns[2].metric("Echecs", summary.get("failed", 0))
         columns[3].metric("Bloquees", summary.get("blocked", 0))
         columns[4].metric("Annulees", summary.get("cancelled", 0))
-        columns[5].metric("Tokens", summary.get("total_tokens", 0))
-        efficiency = st.columns(4)
-        efficiency[0].metric("Fichiers lus", summary.get("files_read", 0))
-        efficiency[1].metric(
-            "Artefacts validés", summary.get("artifacts_validated", 0)
-        )
-        efficiency[2].metric(
-            "Tokens / artefact",
-            round(summary.get("tokens_per_validated_artifact") or 0),
-        )
-        efficiency[3].metric(
-            "Répétition moyenne",
-            f"{summary.get('average_repetition_ratio', 0.0):.1%}",
-        )
+        columns[5].metric("Tokens cumulés", summary.get("total_tokens", 0),
+                          help="Entrées et sorties de tous les appels connus. Un historique relu est compté à chaque appel.")
+        usage = st.columns(3)
+        usage[0].metric("Appels modèles", summary.get("model_calls", 0))
+        usage[1].metric("Tokens en entrée", summary.get("input_tokens", 0))
+        usage[2].metric("Tokens en sortie", summary.get("output_tokens", 0))
+        st.caption(f"Cache : {summary.get('cache_read_tokens', 0)} tokens lus, "
+                   f"{summary.get('cache_write_tokens', 0)} écrits. Les prix dépendent du modèle.")
+        rows = []
+        for task in ledger.tasks:
+            metrics = task.metrics
+            rows.append({"Étape": task.title, "Modèle": task.assigned_tier,
+                         "Appels": metrics.model_calls, "Entrée": metrics.input_tokens or 0,
+                         "Sortie": metrics.output_tokens or 0, "Cache lu": metrics.cache_read_tokens})
+        metrics = ledger.coordination_metrics
+        rows.append({"Étape": "Coordination", "Modèle": "chef / revue",
+                     "Appels": metrics.model_calls, "Entrée": metrics.input_tokens or 0,
+                     "Sortie": metrics.output_tokens or 0, "Cache lu": metrics.cache_read_tokens})
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+        st.caption("Les fichiers lus sont des fichiers distincts ; ce nombre ne mesure pas "
+                   "les relectures du contexte. Les artefacts contrôlés ne correspondent pas "
+                   "à une couverture complète du code.")
 
 
 def _render_team_structure(chief) -> None:

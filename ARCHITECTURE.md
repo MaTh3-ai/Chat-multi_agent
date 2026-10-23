@@ -646,3 +646,21 @@ La compaction des instructions statiques est mesurable en caractères. Son effet
 sur les jetons, la latence et la longueur des réponses nécessite des appels réels ;
 un timeout ne permet pas de conclure à un excès de réflexion. Le client ne règle
 pas actuellement un budget de raisonnement spécifique au fournisseur.
+
+
+### Diagnostic du coût d'un chantier
+
+`python tools/diagnose_agent_run.py RUN_ID` lit la sauvegarde du chantier et, si
+disponibles, les checkpoints SQLite en lecture seule. Il ne fait aucun appel
+réseau ou LLM et n'affiche pas les contenus des fichiers ni les prompts. Il
+rapporte les entrées/sorties et caches par étape, puis les usages des messages
+sauvegardés, le nombre et la taille des résultats d'outils et les chemins lus.
+Le raisonnement n'est chiffré que si le fournisseur le renseigne. L'historique
+d'une session peut couvrir plusieurs reprises : ses usages ne doivent pas être
+additionnés aux totaux du ledger.
+
+L'interface présente les jetons cumulés, entrées, sorties, caches et appels par
+étape. Le ratio historique de répétition porte sur le texte final uniquement ;
+il ne mesure pas la répétition du contexte et n'est plus utilisé pour présenter
+l'efficacité des appels. `tokens_per_validated_artifact` reste un champ de
+compatibilité, pas une mesure de rentabilité d'une modification.

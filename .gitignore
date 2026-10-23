@@ -25,3 +25,6 @@ core/_rewriter_probe.txt
 .env.*
 *.pem
 *.key
+
+# Points de reprise et résultats d'exécution locaux
+.agent_state/

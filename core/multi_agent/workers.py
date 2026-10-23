@@ -5,13 +5,19 @@ import random
 import json
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+import hashlib
+from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable
+from langchain_core.messages import ToolMessage, HumanMessage, RemoveMessage
+from core.agent_runtime import CURRENT_EXECUTION, ExecutionSession, RunBudget, UsageRecorder, path_lock
+from tools.custom_tools import PROJECT_ROOT, WORKSPACE_ROOT, resolve_workspace_path
 
 from core.models import get_tier, resolve_tier_to_model_alias, sanitize_temperature
 from core.multi_agent.ledger import STATUS_CANCELLED, Task, TaskLedger, TaskMetrics
-from core.multi_agent.coordination import compile_context, workspace_revision
+from core.multi_agent.coordination import compile_context, workspace_revision, task_paths
 from core.multi_agent.roles import worker_system_prompt, worker_task_prompt
 from llm_engine import create_chat_model, get_workspace_editor_agent, get_workspace_reader_agent
 
@@ -85,6 +91,7 @@ _READ_INTENT_TOKENS = (
 # (proposer_*), comme le chatbot. Aucune ecriture directe : la proposition
 # reste soumise a approbation dans Streamlit.
 _WRITE_INTENT_TOKENS = (
+    "implement", "update", "fix ", "modify", "create ", "edit ", "write ", "delete ", "remove ",
     "modifie",
     "modifier",
     "corrige",
@@ -121,6 +128,7 @@ _RETRYABLE_ERROR_NAMES = {"ThrottlingException", "ModelTimeoutException", "Servi
 _NON_RETRYABLE_ERROR_NAMES = {"AccessDeniedException", "ValidationException", "ResourceNotFoundException", "ValueError", "TypeError", "KeyError", "NameError", "SyntaxError"}
 _SEMAPHORE_LOCK = threading.Lock()
 _MODEL_SEMAPHORES: dict[str, threading.BoundedSemaphore] = {}
+_TASK_PATH_LOCKS: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
@@ -131,6 +139,9 @@ class WorkerExecutionConfig:
     base_backoff_seconds: float = BASE_BACKOFF_SECONDS
     max_backoff_seconds: float = MAX_BACKOFF_SECONDS
     jitter_seconds: float = JITTER_SECONDS
+    budget: RunBudget | None = None
+    artifacts: dict[str, str] = field(default_factory=dict)
+    check_paths: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.max_parallel_workers < 1 or self.max_parallel_per_model < 1:
@@ -159,16 +170,17 @@ class WorkerResult:
     metrics: TaskMetrics = field(default_factory=TaskMetrics)
     input_revision: str = ""
     output_revision: str = ""
+    tool_evidence: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
         return self.error is None and bool(self.deliverable.strip())
 
 
-def extract_text(response: object) -> str:
+def extract_text(response: object, strip: bool = True) -> str:
     content = getattr(response, "content", response)
     if isinstance(content, str):
-        return content.strip()
+        return content.strip() if strip else content
     if isinstance(content, list):
         parts: list[str] = []
         for block in content:
@@ -176,7 +188,8 @@ def extract_text(response: object) -> str:
                 parts.append(block)
             elif isinstance(block, dict) and block.get("text"):
                 parts.append(str(block["text"]))
-        return "\n".join(parts).strip()
+        text = "\n".join(parts)
+        return text.strip() if strip else text
     return str(content).strip()
 
 
@@ -252,55 +265,30 @@ class ModelOutput:
 def invoke_model_with_continuation(model: Any, messages: list[Any], max_continuations: int = MAX_CONTINUATIONS) -> ModelOutput:
     """Invoque un modele simple et recolle automatiquement les suites tronquees."""
     base_messages = list(messages)
-    response = model.invoke(base_messages)
-    text = extract_text(response)
+    session = CURRENT_EXECUTION.get()
+    call_config = {"callbacks": [UsageRecorder(session.budget, session.run_budget, session.cancel_event)]} if session else {}
+    response = model.invoke(base_messages, config=call_config)
+    text = extract_text(response, strip=False)
     metrics = _usage_from_response(response)
     continuations = 0
     while is_truncated_response(response) and text and continuations < max_continuations:
         continuations += 1
-        response = model.invoke([*base_messages, ("ai", text), ("user", CONTINUATION_INSTRUCTION)])
+        response = model.invoke([*base_messages, ("ai", text), ("user", CONTINUATION_INSTRUCTION)], config=call_config)
         metrics = _merge_metrics(metrics, _usage_from_response(response))
-        chunk = extract_text(response)
+        chunk = extract_text(response, strip=False)
         if not chunk:
             break
         text = f"{text}{chunk}"
     return ModelOutput(text=text, metrics=metrics, truncated=is_truncated_response(response), continuations=continuations)
 
 
-def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continuations: int = MAX_CONTINUATIONS) -> ModelOutput:
-    """Invoque un agent LangGraph et recolle les sorties coupees par max_tokens."""
-    state = agent.invoke(
-        {"messages": list(messages)},
-        config={"recursion_limit": AGENT_RECURSION_LIMIT},
-    )
-    state_messages = state.get("messages", []) if isinstance(state, dict) else []
-    if not state_messages:
-        raise ValueError("L'agent n'a produit aucun message.")
-    metrics = _usage_from_messages(state_messages)
-    consumed = len(state_messages)
-    last = state_messages[-1]
-    text = extract_text(last)
-    continuations = 0
-    while is_truncated_response(last) and text and continuations < max_continuations:
-        continuations += 1
-        state = agent.invoke(
-            {"messages": [*state_messages, ("user", CONTINUATION_INSTRUCTION)]},
-            config={"recursion_limit": AGENT_RECURSION_LIMIT},
-        )
-        new_messages = state.get("messages", []) if isinstance(state, dict) else []
-        if not new_messages:
-            break
-        metrics = _merge_metrics(metrics, _usage_from_messages(new_messages[consumed:]))
-        state_messages = new_messages
-        consumed = len(state_messages)
-        last = state_messages[-1]
-        chunk = extract_text(last)
-        if not chunk:
-            break
-        text = f"{text}{chunk}"
+def _output_from_messages(state_messages: list[Any]) -> ModelOutput:
+    """Extract machine evidence exclusively from actual tool messages."""
     tool_evidence: list[dict[str, str]] = []
     proposal_ids: list[str] = []
-    for message in state_messages:
+    for sequence, message in enumerate(state_messages):
+        if not isinstance(message, ToolMessage):
+            continue
         name = str(getattr(message, "name", "") or "")
         if not name:
             continue
@@ -311,7 +299,14 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
             payload = json.loads(content)
         except (json.JSONDecodeError, TypeError):
             payload = None
+        record: dict[str, Any] = {"sequence": sequence, "ok": False}
         if isinstance(payload, dict):
+            record.update({key: payload[key] for key in (
+                "ok", "applied", "content_hash", "category", "command", "checked_files", "returncode",
+                "started_at_ns", "completed_at_ns", "stable_during_check"
+            ) if key in payload})
+            if name == "executer_commande_controlee" and payload.get("stable_during_check") is False:
+                record["ok"] = False
             reference = str(
                 payload.get("path")
                 or payload.get("proposal_id")
@@ -322,51 +317,208 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
             if payload.get("created") and proposal_id:
                 proposal_ids.append(str(proposal_id))
             detail = str(payload.get("message") or payload.get("error") or "")[:300]
+            if payload.get("applied") is True and payload.get("ok") is True:
+                detail = (
+                    "applied=true; "
+                    f"backup={payload.get('backup_path') or 'none'}"
+                )
             if name == "executer_commande_controlee":
+                reference = str(payload.get("cwd", ".")) + ": " + " ".join(payload.get("command") or [])
                 detail = (
                     f"ok={str(bool(payload.get('ok'))).lower()}; "
                     f"returncode={payload.get('returncode')}"
                 )
+            if name == "executer_commande_controlee":
+                for item in payload.get("files", []):
+                    tool_evidence.append({"kind": "file_write", "reference": item["path"],
+                                          "ok": item.get("ok") is True, "applied": True,
+                                          "sequence": sequence, "content_hash": item.get("content_hash"),
+                                          "completed_at_ns": item.get("completed_at_ns", 0),
+                                          "detail": "Modification par commande"})
+            if name == "lire_extraits_fichiers":
+                for item in payload.get("files", []):
+                    if isinstance(item, dict):
+                        tool_evidence.append({"kind": "file_read", "reference": item.get("path", name),
+                                              "ok": item.get("ok") is True, "sequence": sequence,
+                                              "content_hash": item.get("content_hash"), "detail": ""})
+                continue
+            if name == "appliquer_modifications_directement":
+                if payload.get("ok") is False and not payload.get("files"):
+                    tool_evidence.append({"kind": "file_write", "reference": "lot de modifications",
+                                          "ok": False, "sequence": sequence, "detail": detail})
+                for item in payload.get("files", []):
+                    if isinstance(item, dict):
+                        tool_evidence.append({"kind": "file_write", "reference": item.get("path", name),
+                                              "ok": item.get("ok") is True, "applied": item.get("applied") is True,
+                                              "sequence": sequence, "content_hash": item.get("content_hash"),
+                                              "completed_at_ns": item.get("completed_at_ns", 0), "detail": ""})
+                continue
         kind = (
-            "proposal" if name.startswith("proposer_")
-            else "test" if name == "executer_commande_controlee"
+            "file_write" if name.endswith("_directement")
+            else "proposal" if name.startswith("proposer_")
+            else "test" if name == "executer_commande_controlee" and record.get("category") == "test"
+            else "command" if name == "executer_commande_controlee"
             else "file_read"
         )
         tool_evidence.append({
+            **record,
             "kind": kind,
             "reference": reference,
             "detail": detail,
         })
+    last = state_messages[-1] if state_messages else None
+    text = extract_text(last, strip=False) if last is not None and not isinstance(last, ToolMessage) else ""
+    position = len(state_messages) - 2
+    while position > 0 and isinstance(state_messages[position], HumanMessage) and state_messages[position].content == CONTINUATION_INSTRUCTION:
+        text = extract_text(state_messages[position - 1], strip=False) + text
+        position -= 2
+    # A tool result is evidence, not a generated final response.
     return ModelOutput(
         text=text,
-        metrics=metrics,
+        metrics=_usage_from_messages(state_messages),
         truncated=is_truncated_response(last),
-        continuations=continuations,
         tool_evidence=tool_evidence,
         proposal_ids=list(dict.fromkeys(proposal_ids)),
     )
 
 
-def _merge_tool_evidence(text: str, output: ModelOutput) -> str:
+def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continuations: int = MAX_CONTINUATIONS,
+                                  session: ExecutionSession | None = None, complete_result: bool = False) -> ModelOutput:
+    """Resume pending graph nodes; never regenerate a tool-backed final report."""
+    config: dict[str, Any] = {"recursion_limit": AGENT_RECURSION_LIMIT}
+    graph_input: Any = {"messages": list(messages)}
+    if session is not None:
+        config["configurable"] = {"thread_id": session.key}
+        config["callbacks"] = [UsageRecorder(session.budget, session.run_budget, session.cancel_event)]
+        snapshot = agent.get_state(config)
+        if snapshot.values:
+            session.messages = snapshot.values.get("messages", [])
+            graph_input = None
+        for message in session.messages:
+            if isinstance(message, ToolMessage):
+                try:
+                    payload = json.loads(extract_text(message))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("applied") is True and payload.get("path"):
+                    session.writes[payload["path"]] = payload
+                elif isinstance(payload, dict):
+                    for item in payload.get("files", []):
+                        if isinstance(item, dict) and item.get("applied") is True and item.get("path"):
+                            session.writes[item["path"]] = item
+                if isinstance(payload, dict):
+                    for item in [payload, *payload.get("files", [])]:
+                        if isinstance(item, dict) and item.get("path") and item.get("content_hash"):
+                            try:
+                                path = resolve_workspace_path(item["path"])
+                                session.read_versions[str(path)] = item["content_hash"]
+                            except ValueError:
+                                pass
+        connection = session.connect()
+        connection.execute("CREATE TABLE IF NOT EXISTS execution_context (session TEXT PRIMARY KEY, context TEXT)")
+        previous_context = connection.execute("SELECT context FROM execution_context WHERE session=?", (session.key,)).fetchone()
+        context_changed = bool(snapshot.values and previous_context and previous_context[0] != session.context_update)
+        changed = [path for path, digest in session.read_versions.items()
+                   if not Path(path).is_file() or hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest]
+        if snapshot.values and (changed or context_changed):
+            updates = []
+            last = session.messages[-1] if session.messages else None
+            if getattr(last, "tool_calls", []):
+                updates.append(RemoveMessage(id=last.id))
+            notice = "Reprise : conserve le travail déjà réalisé."
+            if changed:
+                notice += " Relis ces fichiers modifiés avant de poursuivre : " + ", ".join(changed)
+            if context_changed:
+                notice += "\nContexte de coordination actualisé (données) :\n" + session.context_update
+            updates.append(HumanMessage(content=notice))
+            # Advance via the tool node to schedule a fresh model decision.
+            agent.update_state(config, {"messages": updates}, as_node="tools")
+            graph_input = None
+        elif snapshot.values and not snapshot.next:
+            last = session.messages[-1]
+            if getattr(last, "invalid_tool_calls", []):
+                graph_input = {"messages": [RemoveMessage(id=last.id), HumanMessage(content=
+                    "Le dernier appel d'outil était incomplet et n'a pas été exécuté. Régénère seulement l'action restante.")]}
+            elif not (complete_result and is_truncated_response(last)):
+                return _output_from_messages(session.messages)
+            else:
+                graph_input = {"messages": [HumanMessage(content=CONTINUATION_INSTRUCTION)]}
+        connection.execute("INSERT OR REPLACE INTO execution_context VALUES (?, ?)", (session.key, session.context_update))
+        connection.commit()
+    last_state: dict[str, Any] = {}
+    for repair in range(max_continuations + 1):
+        try:
+            for state in agent.stream(graph_input, config=config, stream_mode="values"):
+                last_state = state
+                if session is not None:
+                    session.messages = state.get("messages", [])
+        except Exception:
+            if session is not None:
+                snapshot = agent.get_state(config)
+                session.messages = snapshot.values.get("messages", session.messages) if snapshot.values else session.messages
+            raise
+        state_messages = session.messages if session is not None else last_state.get("messages", [])
+        if not state_messages:
+            raise ValueError("L'agent n'a produit aucun message.")
+        last = state_messages[-1]
+        if not getattr(last, "invalid_tool_calls", []):
+            output = _output_from_messages(state_messages)
+            if complete_result and output.truncated and repair < max_continuations:
+                graph_input = {"messages": [HumanMessage(content=CONTINUATION_INSTRUCTION)]}
+                continue
+            output.continuations = repair
+            # A truncated report costs no extra call. Only a missing tool
+            # action merits regeneration, with the prior work retained.
+            return output
+        if repair == max_continuations:
+            raise ValueError("Appel d'outil toujours incomplet ; les écritures précédentes sont conservées.")
+        graph_input = {"messages": [RemoveMessage(id=last.id), HumanMessage(content=
+            "Le dernier appel d'outil était incomplet et n'a pas été exécuté. "
+            "Régénère uniquement l'action restante ; les outils précédents ont déjà été appliqués.")]}
+    raise ValueError("Aucun résultat d'agent.")
+
+
+def _merge_tool_evidence(text: str, output: ModelOutput, preserve_text: bool = False) -> str:
     """Ajoute les preuves réelles des outils à une enveloppe JSON valide."""
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return text
+        payload = None
     if not isinstance(payload, dict):
-        return text
-    evidence = payload.get("evidence")
-    if not isinstance(evidence, list):
-        evidence = []
-    evidence.extend(output.tool_evidence)
-    payload["evidence"] = evidence
-    proposal_ids = payload.get("proposal_ids")
-    if not isinstance(proposal_ids, list):
-        proposal_ids = []
-    payload["proposal_ids"] = list(dict.fromkeys([
-        *(str(item) for item in proposal_ids),
-        *output.proposal_ids,
-    ]))
+        # Un worker peut avoir appliqué les fichiers correctement puis manquer
+        # de tokens pour son bref rapport JSON. Préserve la preuve des écritures
+        # et évite de classer tout le travail comme échec ou artefact inconnu.
+        if not output.tool_evidence:
+            return text
+        writes = [
+            item for item in output.tool_evidence
+            if item.get("kind") == "file_write" and item.get("ok") is True and item.get("applied") is True
+        ]
+        payload = {
+            "state": "applied" if writes else "observed",
+            "summary": (
+                "Modifications écrites dans le workspace."
+                if writes
+                else "Le worker a utilisé des outils; son rapport est incomplet."
+            ),
+            "references": list(dict.fromkeys(
+                item.get("reference", "")
+                for item in output.tool_evidence
+                if item.get("reference")
+            )),
+            "evidence": output.tool_evidence,
+            "proposal_ids": output.proposal_ids,
+            "blockers": [],
+            "report_incomplete": output.truncated,
+        }
+        if preserve_text:
+            payload["result"] = text
+        return json.dumps(payload, ensure_ascii=False)
+    # Discard self-reported evidence. Only the runtime can populate it.
+    payload["state"] = "observed"
+    payload["evidence"] = output.tool_evidence
+    payload["proposal_ids"] = output.proposal_ids
+    payload["references"] = list(dict.fromkeys(item["reference"] for item in output.tool_evidence))
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -406,6 +558,8 @@ def _task_requires_reading(task: Task, context: str = "") -> bool:
     haystack = f"{task.title}\n{task.description}".casefold()
     if any(token in haystack for token in _READ_INTENT_TOKENS):
         return True
+    if any((WORKSPACE_ROOT / path).is_file() for path in task_paths(task)):
+        return True
     context_text = str(context or "").casefold()
     return any(token in context_text for token in _READ_INTENT_TOKENS)
 
@@ -423,31 +577,74 @@ def _task_requires_writing(task: Task, context: str = "") -> bool:
     return any(token in context_text for token in _WRITE_INTENT_TOKENS)
 
 
-def _invoke_editor_agent(model_alias: str, temperature: float | int | None, system_prompt: str, task_prompt: str) -> ModelOutput:
-    """Invoque un agent LangGraph capable de CONSULTER et de PROPOSER (proposer_*).
+def _task_requires_execution(task: Task) -> bool:
+    text = f"{task.title}\n{task.description}".casefold()
+    return any(token in text for token in (
+        "pytest", "unittest", "ruff", "npm test", "npm run", "exécuter", "executer",
+        "lancer les tests", "run tests", "compiler", "typecheck", "lint", "build",
+    ))
 
-    Le worker peut ainsi creer de vraies propositions de modification, comme le
-    chatbot. L'agent n'ecrit jamais directement : les propositions restent
-    soumises a approbation dans Streamlit. Les sorties coupees par la limite de
-    tokens sont automatiquement reprises.
-    """
-    agent = get_workspace_editor_agent(model_alias=model_alias, temperature=temperature)
+
+def _invoke_editor_agent(model_alias: str, temperature: float | int | None, system_prompt: str, task_prompt: str) -> ModelOutput:
+    """Direct editor with persistent, resumable graph state."""
+    session = CURRENT_EXECUTION.get()
+    agent = session.agent if session else None
+    if agent is None:
+        agent = get_workspace_editor_agent(model_alias=model_alias, temperature=temperature,
+                                          checkpointer=session.checkpointer() if session else None)
+        if session:
+            session.agent = agent
     return invoke_agent_with_continuation(
-        agent, [("system", system_prompt), ("user", task_prompt)]
+        agent, [("system", system_prompt), ("user", task_prompt)], session=session,
     )
 
 
-def _invoke_reader_agent(model_alias: str, temperature: float | int | None, system_prompt: str, task_prompt: str) -> ModelOutput:
+def _invoke_reader_agent(model_alias: str, temperature: float | int | None, system_prompt: str, task_prompt: str,
+                         allow_execution: bool = False) -> ModelOutput:
     """Invoque un agent LangGraph de LECTURE SEULE (outils de consultation).
 
     Le worker peut ainsi ouvrir reellement les fichiers du workspace au lieu de
     se contenter du contexte pre-lu et tronque. L'agent n'expose aucun outil
     d'ecriture, de proposition ou de memoire.
     """
-    agent = get_workspace_reader_agent(model_alias=model_alias, temperature=temperature)
+    session = CURRENT_EXECUTION.get()
+    agent = session.agent if session else None
+    if agent is None:
+        agent = get_workspace_reader_agent(model_alias=model_alias, temperature=temperature,
+                                          checkpointer=session.checkpointer() if session else None,
+                                          allow_execution=allow_execution)
+        if session:
+            session.agent = agent
     return invoke_agent_with_continuation(
-        agent, [("system", system_prompt), ("user", task_prompt)]
+        agent, [("system", system_prompt), ("user", task_prompt)], session=session,
+        complete_result=not allow_execution,
     )
+
+
+def _invoke_deterministic_command(task: Task, session: ExecutionSession) -> ModelOutput:
+    """A known control command requires no model decision or generated report."""
+    from tools.custom_tools import executer_commande_controlee, IGNORED_DIRECTORY_NAMES
+    from core.agent_runtime import snapshot_files
+    connection = session.connect()
+    connection.execute("CREATE TABLE IF NOT EXISTS control_runs (session TEXT PRIMARY KEY, result TEXT)")
+    row = connection.execute("SELECT result FROM control_runs WHERE session=?", (session.key,)).fetchone()
+    if row and row[0] is None:
+        raise RuntimeError("Commande interrompue : effets incertains, vérifier avant de relancer.")
+    payload = json.loads(row[0]) if row else None
+    current = snapshot_files(WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES)
+    if payload is None or payload.get("checked_files") != current:
+        connection.execute("INSERT OR REPLACE INTO control_runs VALUES (?, NULL)", (session.key,))
+        connection.commit()
+        payload = json.loads(executer_commande_controlee.invoke({"commande": task.command}))
+        connection.execute("UPDATE control_runs SET result=? WHERE session=?", (json.dumps(payload), session.key))
+        connection.commit()
+    blockers = [] if payload.get("ok") else [payload.get("error") or "Le contrôle a échoué ; consulter sa sortie."]
+    session.messages = [ToolMessage(name="executer_commande_controlee", tool_call_id="control",
+                                   content=json.dumps(payload))]
+    output = _output_from_messages(session.messages)
+    output.text = json.dumps({"summary": "Contrôle réussi." if not blockers else "Contrôle non abouti.",
+                              "blockers": blockers}, ensure_ascii=False)
+    return output
 
 
 def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig | None = None, cancel_event: threading.Event | None = None, progress: ProgressCallback | None = None) -> WorkerResult:
@@ -466,7 +663,31 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
         _emit(progress, "error", f"{task.title} : configuration invalide ({result.error}).", task.id)
         return result
 
-    semaphore = _model_semaphore(result.model_alias, config.max_parallel_per_model)
+    semaphore = _model_semaphore(result.model_alias, min(config.max_parallel_per_model, tier_conf.get("max_parallel", 1)))
+    fingerprint = hashlib.sha256(json.dumps([task.title, task.description, task.acceptance_criteria,
+                                             task.expected_output, result.model_alias, task.capabilities, task.command],
+                                            ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+    session = ExecutionSession(key=f"{task.execution_id}:{fingerprint}",
+                               root=PROJECT_ROOT / ".agent_state", run_budget=config.budget, cancel_event=cancel_event,
+                               context_update=context, check_paths=set(config.check_paths),
+                               artifacts={key: value for key, value in config.artifacts.items() if key in task.dependencies})
+    legacy = hashlib.sha256(json.dumps([task.title, task.description, task.acceptance_criteria,
+                                        task.expected_output, result.model_alias, context,
+                                        {key: value for key, value in config.artifacts.items() if key in task.dependencies}],
+                                       ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:16]
+    connection = session.connect()
+    connection.execute("CREATE TABLE IF NOT EXISTS session_aliases (identity TEXT PRIMARY KEY, thread TEXT)")
+    alias = connection.execute("SELECT thread FROM session_aliases WHERE identity=?", (session.key,)).fetchone()
+    identity = session.key
+    if alias:
+        session.key = alias[0]
+    elif connection.execute("SELECT 1 FROM sqlite_master WHERE name='checkpoints'").fetchone():
+        legacy_key = f"{task.execution_id}:{legacy}"
+        if connection.execute("SELECT 1 FROM checkpoints WHERE thread_id=? LIMIT 1", (legacy_key,)).fetchone():
+            session.key = legacy_key
+    connection.execute("INSERT OR IGNORE INTO session_aliases VALUES (?, ?)", (identity, session.key))
+    connection.commit()
+    runtime_token = CURRENT_EXECUTION.set(session)
     _emit(progress, "worker", f"{task.title} : en attente d'un creneau {result.model_alias}.", task.id)
     max_attempts = min(
         config.max_attempts,
@@ -488,17 +709,23 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                     task.title,
                     task.description,
                     context,
+                    acceptance_criteria=getattr(task, "acceptance_criteria", []),
+                    expected_output=getattr(task, "expected_output", ""),
                     target_output_tokens=TARGET_OUTPUT_TOKENS,
                 )
                 declared_capabilities = set(getattr(task, "capabilities", []) or [])
-                if "propose_write" in declared_capabilities:
+                if {"write", "propose_write"} & declared_capabilities:
                     mode = "edition"
+                elif "execute" in declared_capabilities:
+                    mode = "controle"
                 elif "read" in declared_capabilities:
-                    mode = "lecture"
+                    mode = "controle" if _task_requires_execution(task) else "lecture"
                 elif "generate" in declared_capabilities:
                     mode = "redaction"
                 elif _task_requires_writing(task, context):
                     mode = "edition"
+                elif _task_requires_execution(task):
+                    mode = "controle"
                 elif _task_requires_reading(task, context):
                     mode = "lecture"
                 else:
@@ -512,38 +739,64 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                     task.id,
                 )
 
-                if mode == "edition":
+                if task.command:
+                    if task.capabilities != ["execute"]:
+                        raise ValueError("Une commande déterministe exige la capacité execute seule.")
+                    output = _invoke_deterministic_command(task, session)
+                elif mode == "edition":
                     output = _invoke_editor_agent(result.model_alias, temperature, system_prompt, task_prompt)
                 elif mode == "lecture":
                     output = _invoke_reader_agent(result.model_alias, temperature, system_prompt, task_prompt)
+                elif mode == "controle":
+                    output = _invoke_reader_agent(result.model_alias, temperature, system_prompt, task_prompt, allow_execution=True)
                 else:
                     model = create_chat_model(model_alias=result.model_alias, temperature=temperature)
                     output = invoke_model_with_continuation(
                         model, [("system", system_prompt), ("user", task_prompt)]
                     )
-            deliverable = _merge_tool_evidence(output.text.strip(), output)
+            deliverable = _merge_tool_evidence(output.text.strip(), output, preserve_text=mode in {"lecture", "redaction"})
             if not deliverable:
                 raise ValueError("Le modele a renvoye un livrable vide.")
             result.truncated = output.truncated
+            result.tool_evidence = output.tool_evidence
             result.continuations = output.continuations
             if output.truncated:
-                # La coupure est signalee comme une LIMITE explicite, pas comme
-                # une erreur : le livrable partiel reste exploitable et la revue
-                # humaine sait exactement ce qui manque.
-                deliverable += (
-                    "\n\n[LIVRABLE INCOMPLET] La sortie reste tronquee apres "
-                    f"{output.continuations} reprise(s) automatique(s). "
-                    "Relance la tache sur un perimetre plus etroit pour obtenir la suite."
-                )
+                # Ne colle pas un marqueur en texte libre à la fin du JSON :
+                # cela détruirait l'enveloppe et ferait perdre les preuves.
+                try:
+                    partial = json.loads(deliverable)
+                except (json.JSONDecodeError, TypeError):
+                    partial = None
+                if not isinstance(partial, dict):
+                    partial = {
+                        "state": "observed",
+                        "summary": (deliverable or "Sortie incomplète.")[:500],
+                        "references": [],
+                        "evidence": output.tool_evidence,
+                        "proposal_ids": output.proposal_ids,
+                        "tests": [],
+                        "blockers": [],
+                        "claims": [],
+                        "result": deliverable if mode == "redaction" else "",
+                    }
+                partial["report_incomplete"] = True
+                if any(item.get("kind") == "file_write" and item.get("ok") is True
+                       and item.get("applied") is True for item in output.tool_evidence):
+                    partial["state"] = "applied"
+                deliverable = json.dumps(partial, ensure_ascii=False)
             result.deliverable = deliverable
+            result.error = None
+            result.error_type = None
+            result.retryable = False
             result.metrics = output.metrics
-            result.metrics.model_calls = max(result.metrics.model_calls, attempt)
             result.metrics.retry_count = attempt - 1
             result.metrics.target_output_tokens = TARGET_OUTPUT_TOKENS
             result.metrics.target_output_exceeded = bool(
-                result.metrics.output_tokens is not None
-                and result.metrics.output_tokens > TARGET_OUTPUT_TOKENS
+                len(output.text) > TARGET_OUTPUT_TOKENS * 4
             )
+            if output.truncated and mode in {"redaction", "lecture"}:
+                result.error_type = "IncompleteOutput"
+                result.error = "Livrable textuel incomplet après les continuations autorisées ; contenu partiel conservé."
             _emit(
                 progress,
                 "worker",
@@ -562,7 +815,7 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
             result.error_type = _exception_name(exc)
             result.error = f"{result.error_type}: {exc}"
             result.retryable = retryable
-            if not retryable or attempt >= config.max_attempts:
+            if not retryable or attempt >= max_attempts:
                 _emit(progress, "error", f"{task.title} : echec ({result.error}).", task.id)
                 break
             delay = min(config.max_backoff_seconds, config.base_backoff_seconds * (2 ** (attempt - 1))) + random.uniform(0.0, config.jitter_seconds)
@@ -575,10 +828,27 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
             )
             time.sleep(delay)
 
+    if result.error and session.messages:
+        partial_output = _output_from_messages(session.messages)
+        result.tool_evidence = partial_output.tool_evidence
+        if partial_output.tool_evidence and not result.deliverable:
+            result.deliverable = _merge_tool_evidence("", partial_output)
+    # The checkpoint includes messages from successful calls before a failure.
+    # Preserve their usage as well; timeout billing remains explicitly unknown.
+    recorded = session.budget.snapshot()
+    if session is not None:
+        result.metrics.input_tokens = recorded["input_tokens"]
+        result.metrics.output_tokens = recorded["output_tokens"]
+        result.metrics.total_tokens = recorded["input_tokens"] + recorded["output_tokens"]
+        result.metrics.model_calls = recorded["model_calls"]
+        result.metrics.unknown_usage_calls = recorded["unknown_usage_calls"]
+        result.metrics.cache_read_tokens = recorded["cache_read_tokens"]
+        result.metrics.cache_write_tokens = recorded["cache_write_tokens"]
+    CURRENT_EXECUTION.reset(runtime_token)
+    session.close()
     result.completed_at = time.time()
     result.latency_ms = (result.completed_at - started) * 1000
     result.metrics.latency_ms = result.latency_ms
-    result.metrics.model_calls = max(result.metrics.model_calls, result.attempt_count)
     result.metrics.retry_count = max(0, result.attempt_count - 1)
     return result
 
@@ -587,48 +857,80 @@ def build_context(ledger: TaskLedger, task: Task, discovery_context: str = "") -
     return compile_context(ledger, task, discovery_context)
 
 
-def run_tasks_parallel(ledger: TaskLedger, tasks: list[Task], max_workers: int = MAX_PARALLEL_WORKERS, config: WorkerExecutionConfig | None = None, cancel_event: threading.Event | None = None, discovery_context: str = "", progress: ProgressCallback | None = None) -> list[WorkerResult]:
+def run_tasks_parallel(ledger: TaskLedger, tasks: list[Task], max_workers: int = MAX_PARALLEL_WORKERS,
+                       config: WorkerExecutionConfig | None = None, cancel_event: threading.Event | None = None,
+                       discovery_context: str = "", progress: ProgressCallback | None = None,
+                       drain_ready: bool = False, on_result: Callable[[], None] | None = None) -> list[WorkerResult]:
+    """Bounded scheduler; only this thread updates the ledger.
+
+    Compatibility mode returns one batch. drain_ready applies results immediately
+    and admits newly ready dependencies without waiting for unrelated workers.
+    """
     if not tasks or ledger.cancel_requested:
         return []
     config = config or WorkerExecutionConfig(max_parallel_workers=max_workers)
     cancel_event = cancel_event or threading.Event()
-    prepared: list[tuple[Task, str]] = []
-    for task in tasks:
-        if task not in ledger.ready_tasks():
-            raise ValueError(f"La tache {task.id} n'est pas prete a etre executee.")
-        attempt = ledger.begin_task(task.id)
-        task.input_revision = workspace_revision()
-        ledger.log_event("task_started", f"Debut de {task.title}.", task_id=task.id, attempt=attempt)
-        prepared.append((task, build_context(ledger, task, discovery_context)))
-    results: list[WorkerResult] = []
-    workers = max(1, min(config.max_parallel_workers, len(prepared)))
-    order = {task.id: index for index, (task, _) in enumerate(prepared)}
-    _emit(
-        progress,
-        "state",
-        f"Vague de {len(prepared)} tache(s), {workers} worker(s) en parallele.",
-    )
+    if any(task not in ledger.ready_tasks() for task in tasks):
+        raise ValueError("Une tâche n'est pas prête à être exécutée.")
+    initial_ids = {task.id for task in tasks}
+    submitted = set()
+    active_paths: set[str] = set()
+    results = []
+    workers = max(1, config.max_parallel_workers)
+
+    def execute_owned(task, context, task_config, paths):
+        with _SEMAPHORE_LOCK:
+            locks = [_TASK_PATH_LOCKS.setdefault(path, threading.Lock()) for path in paths]
+        with ExitStack() as stack:
+            for lock in locks:
+                stack.enter_context(lock)
+            task.input_revision = workspace_revision()
+            result = run_single_task(task, context, task_config, cancel_event, progress)
+            result.input_revision = task.input_revision
+            result.output_revision = workspace_revision()
+            return result
+
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ma-worker") as pool:
-        futures = {pool.submit(run_single_task, task, context, config, cancel_event, progress): task for task, context in prepared}
-        completed = 0
-        for future in as_completed(futures):
-            task = futures[future]
-            try:
-                worker_result = future.result()
-                worker_result.input_revision = task.input_revision
-                worker_result.output_revision = workspace_revision()
-                results.append(worker_result)
-            except Exception as exc:
-                results.append(WorkerResult(task_id=task.id, tier=task.assigned_tier, error=f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__))
-            completed += 1
-            _emit(
-                progress,
-                "state",
-                f"Avancement de la vague : {completed}/{len(prepared)} tache(s) terminee(s).",
-                task.id,
-            )
-    results.sort(key=lambda result: order[result.task_id])
-    return results
+        futures = {}
+        while True:
+            if not cancel_event.is_set() and not ledger.cancel_requested:
+                ledger.sync_artifact_states()
+                for task in ledger.ready_tasks():
+                    if len(futures) >= workers:
+                        break
+                    if task.id in submitted or (not drain_ready and task.id not in initial_ids):
+                        continue
+                    paths = sorted(str(resolve_workspace_path(path)) for path in task_paths(task))
+                    if active_paths.intersection(paths):
+                        continue
+                    artifacts = {dep.id: dep.artifact.result or dep.deliverable or ""
+                                 for dep in ledger.tasks if dep.artifact and dep.id in task.dependencies}
+                    task_config = replace(config, artifacts=artifacts)
+                    context = build_context(ledger, task, discovery_context)
+                    attempt = ledger.begin_task(task.id)
+                    ledger.log_event("task_started", f"Début de {task.title}.", task_id=task.id, attempt=attempt)
+                    submitted.add(task.id)
+                    active_paths.update(paths)
+                    futures[pool.submit(execute_owned, task, context, task_config, paths)] = (task, paths)
+            if not futures:
+                break
+            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in completed:
+                task, paths = futures.pop(future)
+                active_paths.difference_update(paths)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = WorkerResult(task_id=task.id, tier=task.assigned_tier,
+                                          error=f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)
+                results.append(result)
+                if drain_ready:
+                    apply_results(ledger, [result])
+                    if on_result:
+                        on_result()
+                _emit(progress, "state", f"Tâche achevée : {task.title}.", task.id)
+    order = {task.id: i for i, task in enumerate(ledger.tasks)}
+    return sorted(results, key=lambda result: order[result.task_id])
 
 
 def apply_results(ledger: TaskLedger, results: list[WorkerResult]) -> None:
@@ -640,8 +942,15 @@ def apply_results(ledger: TaskLedger, results: list[WorkerResult]) -> None:
             task = ledger.require_task(result.task_id)
             task.input_revision = result.input_revision
             task.output_revision = result.output_revision
-            ledger.set_deliverable(result.task_id, result.deliverable, result.metrics)
+            ledger.set_deliverable(result.task_id, result.deliverable, result.metrics,
+                                   trusted_evidence=result.tool_evidence)
             ledger.log_event("task_succeeded", "Livrable produit.", task_id=result.task_id, model_alias=result.model_alias, attempt=result.attempt_count, metadata={"latency_ms": result.latency_ms})
         else:
+            if result.deliverable and result.tool_evidence:
+                task = ledger.require_task(result.task_id)
+                task.input_revision = result.input_revision
+                task.output_revision = result.output_revision
+                ledger.set_deliverable(result.task_id, result.deliverable,
+                                       trusted_evidence=result.tool_evidence)
             ledger.set_error(result.task_id, result.error or "Erreur inconnue.", result.error_type, result.retryable, result.metrics)
             ledger.log_event("task_failed", result.error or "Erreur inconnue.", level="error", task_id=result.task_id, model_alias=result.model_alias, attempt=result.attempt_count, metadata={"retryable": result.retryable, "latency_ms": result.latency_ms})

@@ -125,7 +125,10 @@ telle proposition apparaissait dans l'interface sans pouvoir être approuvée.
 
 ### Approbation
 
-Seule l'interface peut appeler `approve_proposal()` ou `reject_proposal()`.
+Pour le chat classique, seule l'interface peut appeler `approve_proposal()` ou
+`reject_proposal()`. Les workers multi-agents utilisent des outils d'écriture
+directe distincts : ceux-ci appliquent la modification avec sauvegarde et
+validation syntaxique, sans proposition en attente.
 
 L'interface propose aussi une validation groupée (`approve_pending_proposals`)
 et un mode optionnel de validation automatique. La validation groupée constitue
@@ -163,8 +166,10 @@ le suivi et l'amélioration des prompts.
 ### Protocole de coordination compact
 
 Chaque worker retourne un objet JSON court contenant l'état de l'artefact,
-son résumé, ses références, ses preuves, ses tests, ses propositions et ses
-affirmations structurées. Le `TaskLedger` transforme cette sortie en `Artifact`
+son résumé, ses références, ses preuves, ses tests et ses affirmations
+structurées. En mode multi-agent, les modifications sont écrites directement
+dans le workspace par des outils bornés, sauvegardés et validés; le circuit
+d'approbation reste réservé au chat classique. Le `TaskLedger` transforme cette sortie en `Artifact`
 persistant. Une sortie historique non structurée reste acceptée, mais elle est
 marquée comme telle et n'alimente pas automatiquement le registre de preuves.
 
@@ -179,8 +184,9 @@ identifiants de propositions avec leur état persistant et actualise la révisio
 du workspace.
 
 `coordination.compile_context()` remplace la concaténation des rapports. Il
-transmet uniquement une découverte tronquée, les résumés d'artefacts directement
-dépendants et les contradictions ouvertes concernant la tâche. Les objectifs
+transmet un manifeste de fichiers, quelques faits extraits des configurations,
+les résumés des dépendances et les contradictions propres à la tâche. Les
+livrables complets restent consultables à la demande via `lire_resultat_tache`. Les objectifs
 de taille restent souples et ne bloquent jamais l'exécution.
 
 Une révision stable du workspace est enregistrée avant et après chaque tâche.
@@ -196,7 +202,9 @@ validé. Ces mesures sont informatives et ne déclenchent aucun arrêt.
 ### Architecture
 
 - Orchestrateur hiérarchique central.
-- Chef de projet au tier `expert`.
+- Chef au tier `smart` par défaut ; `expert` pour les réparations sémantiques,
+  les sujets critiques ou les plans comportant au moins six tâches.
+  `MULTI_AGENT_CHIEF_TIER` permet de choisir le tier par défaut.
 - Workers assignables aux tiers `nano`, `fast`, `smart`.
 - Communication en étoile via `TaskLedger`.
 - Exécution parallèle avec `ThreadPoolExecutor`, jamais `asyncio.gather`.
@@ -255,14 +263,13 @@ modèle ; ils ne représentent pas des managers récursifs.
 
 Ce choix suit un pattern de production plus robuste pour ce type d'application :
 
-- le plan est une structure déclarative validée avant exécution ;
+- le plan est une structure déclarative compacte, validée avant exécution ;
 - les dépendances forment un DAG borné, exécuté par vagues parallèles ;
-- l'escalade de tier est automatique mais limitée par tâche et par nombre de
-  relances ;
-- une revue indépendante est déclenchée explicitement pour les livrables
-  critiques ;
-- l'humain conserve la validation du plan, des propositions d'écriture et de la
-  synthèse ;
+- les erreurs transitoires peuvent être relancées au même tier, sans escalade
+  coûteuse sur les erreurs permanentes ;
+- une revue indépendante est réservée aux livrables critiques ;
+- les workers peuvent écrire directement dans le workspace; l'humain garde la
+  visibilité sur le plan et la synthèse, sans approbation fichier par fichier ;
 - les coûts, les appels et les erreurs restent observables dans le ledger.
 
 Un sous-chef ou une délégation récursive ne doit être ajouté que si un besoin
@@ -273,16 +280,16 @@ de garantie supplémentaire.
 
 ### Capacités et budgets de plan
 
-Chaque tâche peut maintenant déclarer ses capacités (`read`, `propose_write` ou
-`generate`, avec `auto` pour conserver la détection de compatibilité). Le worker
+Chaque tâche peut déclarer `read`, `write`, `execute` ou `generate`, avec `auto`
+pour la détection de compatibilité et `propose_write` comme ancien alias d’édition. Le worker
 privilégie cette déclaration et ne retombe sur les heuristiques textuelles que
 pour les anciens chantiers.
 
-Le plan borne également `max_retries` (0 à 2) et `max_escalations` (0 à 1) par
-tâche. Le ledger conserve ces paramètres pour les reprises et les restaurations.
+Le plan borne `max_retries` (0 à 2). Le SDK ne relance pas par défaut et
+l’orchestrateur ne rajoute pas une deuxième boucle de reprise. Le champ historique
+`max_escalations` reste chargeable, mais n’ajoute aucun appel automatique.
 Avant l'exécution, l'interface affiche une estimation conservative en unités
-relatives de coût, calculée à partir du tier, des retries, des escalades et des
-revues. Il s'agit d'un indicateur de budget, pas d'un prix AWS.
+relatives de coût, calculée à partir du tier, des reprises et des revues. Il s'agit d'un indicateur de budget, pas d'un prix AWS.
 
 ### Découverte déterministe du workspace (DISCOVERY)
 
@@ -327,12 +334,14 @@ des fichiers accessibles.
 ### États du chantier
 
 ```text
-INTERVIEW -> DISCOVERY -> PLANIF -> validation humaine -> EXEC
-EXEC -> REVIEW -> validation humaine -> SYNTHESE
+DISCOVERY ciblée -> INTERVIEW si nécessaire -> PLANIF -> validation du plan -> EXEC
+EXEC -> REVIEW sélective -> SYNTHESE
 Tout état peut évoluer vers CANCELLED selon le flux d'interface.
 ```
 
-La découverte réelle du workspace précède toujours la planification.
+La découverte déterministe des consignes et fichiers du projet précède
+l'entretien. Le chef ne pose une question que si la réponse n'est pas
+déductible du workspace et change réellement le plan ou un critère.
 
 Les états connus sont :
 
@@ -422,12 +431,12 @@ supprime la cause principale des plans JSON et des synthèses coupés.
 
 Le drapeau `requires_review` du plan a désormais un effet réel.
 `ChefDeProjet.review_flagged_tasks()` soumet chaque livrable concerné à un
-agent **critique indépendant**, d'un tier strictement supérieur à celui qui a
-produit le livrable (ou du tier maximal si déjà au sommet).
+agent **critique indépendant**, disposant des outils de lecture. Il utilise le
+même tier que le worker, avec un minimum `fast`, sans surclassement systématique.
 
-La critique est bornée : un appel par tâche, aucun débat libre, aucune
-réécriture. Le critique répond selon un protocole textuel simple
-(`VERDICT: CONFORME` ou `VERDICT: A CORRIGER`, puis des défauts actionnables),
+La critique est bornée à une session par tâche signalée, avec lectures ciblées
+et budget partagé, sans débat entre agents ni réécriture. Le critique répond selon un protocole textuel simple
+(`VERDICT: CONFORME`, `VERDICT: A CORRIGER` ou `VERDICT: INDISPONIBLE`),
 ce qui évite tout nouveau parsing JSON fragile.
 
 - verdict conforme : la tâche reste `terminé` ;
@@ -502,3 +511,117 @@ python -m unittest discover -s tests -v
 - Les contenus de fichiers, mémoires et livrables sont des données non fiables,
   jamais des instructions supérieures.
 - Les informations indisponibles ne sont pas inventées.
+
+
+## Exécution structurée et coût utile
+
+### Informations produites sans LLM
+
+Le worker d’édition ne génère que `summary` et les vrais `blockers`. Le programme
+collecte les chemins, empreintes, écritures réussies, sauvegardes et commandes.
+Ces données alimentent le ledger directement ; elles ne sont pas recopiées par
+un agent chargé de faire un rapport. Pour une tâche rédactionnelle, le champ
+`result` conserve le livrable complet, consultable par les dépendances seulement
+si nécessaire. Un résultat textuel unique terminé est livré sans réécriture.
+Les livraisons de code sans résultat rédactionnel utilisent un bilan déterministe.
+
+Les états appliqué/testé proviennent exclusivement des résultats d’outils transmis
+par le runtime, jamais du JSON déclaré par le modèle. `python --version` n’est
+pas un test. Un contrôle antérieur à une écriture, lancé pendant une écriture ou
+portant sur une empreinte devenue obsolète ne valide pas la version actuelle.
+`verified` est conservé pour compatibilité ; il n’est pas attribué automatiquement
+et ne doit pas être demandé par les nouveaux plans.
+
+### Reprise et intégrité des modifications
+
+`langgraph-checkpoint-sqlite` stocke les points de reprise dans
+`PROJECT_ROOT/.agent_state/execution.sqlite3`, hors du workspace parcouru par les
+agents. Une erreur transitoire reprend les nœuds en attente et préserve les
+messages et opérations terminées, y compris après redémarrage. Les écritures
+répétées identiques sont reconnues lorsque leur empreinte est toujours présente.
+Les points de reprise ne constituent pas une garantie transactionnelle unique
+entre tous les effets externes possibles et SQLite : les commandes arbitraires
+peuvent produire des effets que le programme ne sait pas annuler.
+
+Les tâches qui mentionnent les mêmes fichiers sont sérialisées par des verrous
+locaux ; les autres restent parallélisables. Les outils d’écriture verrouillent
+chaque fichier et refusent une modification fondée sur une lecture devenue
+obsolète. `appliquer_modifications_directement` prévalide un lot de fichiers et
+réutilise les sauvegardes et la restauration de l’application groupée. Les
+exécutions de commandes restent des programmes locaux : `shell=False` et un
+répertoire de départ contrôlé ne constituent pas un bac à sable système.
+
+### Outils et contexte
+
+- `lire_extraits_fichiers` : plusieurs plages de lignes, numérotées, en un appel.
+- `consulter_diff` : différences des écritures du worker, même sans dépôt Git.
+- `lire_resultat_tache` : accès aux seuls résultats des dépendances déclarées.
+- Commandes de contrôle : Python, pytest, Ruff, Node, npm/pnpm/yarn, TypeScript,
+  Git et rg, si disponibles sur la machine. Les vrais lecteurs et critiques
+  n’ont pas accès à l’outil d’exécution ; les tâches `execute` le reçoivent.
+- Les résultats d’outils exactement répétés sont compactés automatiquement pour
+  l’inférence. Le contenu unique et les points de reprise complets sont préservés.
+- Un appel d’outil tronqué n’est pas exécuté. Seule l’action manquante est
+  régénérée ; une simple troncature du rapport final ne déclenche pas de reprise.
+
+### Configuration et mesure
+
+Après mise à jour : `python -m pip install -r requirements.txt`.
+Tests sans fournisseur ni appel payant : `python -m pytest -q` (pytest requis).
+
+- `AGENT_RUN_MAX_CALLS` : plafond partagé d’appels ; `0` signifie non configuré.
+- `AGENT_RUN_MAX_TOKENS` : arrêt avant le prochain appel après consommation du
+  budget connu ; `0` signifie non configuré. Il ne coupe pas une génération en
+  cours et n’est pas un plafond de facturation strict avec des appels en vol.
+- `BEDROCK_SDK_TOTAL_MAX_ATTEMPTS` : défaut `1` ; le worker gère les reprises.
+- `BEDROCK_PROMPT_CACHE_MODELS` : liste d’alias séparés par des virgules, vide par
+  défaut. À activer uniquement après vérification du support modèle/région et
+  avec une version de langchain-aws prenant en charge `cache_control`. La durée
+  demandée est de cinq minutes ; les écritures de cache peuvent être payantes.
+
+Les métriques incluent les workers, l’entretien, la planification, la revue et
+la synthèse lorsqu’elle est nécessaire. Les reprises sont cumulées ; les tokens
+lus/écrits en cache sont distingués. Les appels interrompus dont la consommation
+est inconnue sont signalés : leur coût n’est pas présenté comme nul. Aucune
+réduction chiffrée de facture n’est supposée sans mesure sur des tâches réelles.
+
+## Fiabilité et parcours simplifié (troisième itération)
+
+- Une écriture échouée non suivie d'une écriture réussie sur le même chemin
+  laisse un blocage explicite. Les contrôles facultatifs absents ne bloquent pas.
+- La synchronisation conserve les empreintes des derniers contrôles retenus,
+  sans invalider leur succès à cause d'un ancien test. Une commande sans
+  périmètre observé ne certifie pas des fichiers.
+- Les commandes observent les créations, modifications et suppressions dans le
+  workspace, même en cas de code retour non nul. Un inventaire de contenu avant
+  et après permet aux workers de contrôle de couvrir les sources des autres
+  tâches. Les répertoires ignorés sont exclus ; les effets externes et les
+  changements externes transitoires restent hors garantie. Cet inventaire peut
+  coûter des E/S sur un grand projet. Les fenêtres de mutation sont sérialisées
+  dans le processus ; le raisonnement des agents reste parallèle.
+- Les empreintes de contrôle restent dans les preuves persistées ; elles sont
+  retirées du contexte envoyé au modèle pour éviter de payer leur relecture.
+- L'identité du checkpoint dépend du contrat, du modèle et des capacités, pas
+  du contexte de coordination. Un changement de contexte ajoute une instruction
+  à la session existante. Les lectures périmées sont signalées aussi pour les
+  graphes interrompus ; une ancienne action en attente doit être redécidée.
+  Les anciens identifiants de checkpoints sont repris lorsqu'ils sont retrouvés.
+- L'arrêt coopératif empêche la prochaine inférence sans couper celle déjà payée.
+  Au chargement d'un chantier, les tâches orphelines « en cours » redeviennent
+  reprenables avec la même identité d'exécution.
+- Le scheduler applique chaque résultat dès sa réception et débloque ses
+  dépendances sans attendre les tâches indépendantes. Les tâches mentionnant
+  un même fichier sont sérialisées et les limites par modèle sont conservées.
+- L'entrée principale demande au chef soit une clarification indispensable, soit
+  directement un plan. Le plan reste consultable et modifiable avant exécution.
+- Un plan peut fournir `command: ["python", "-m", "pytest"]` avec la seule
+  capacité `execute`. Ce contrôle explicite est exécuté sans worker LLM ; une
+  commande interrompue dont le résultat n'a pas été enregistré n'est pas rejouée
+  aveuglément. Le résultat d'un contrôle inchangé peut être réutilisé. Un travail
+  nécessitant choix ou diagnostic conserve un worker ordinaire.
+- L'interface présente les résumés et blocages, une progression basée sur les
+  tâches terminées, et réserve modèles, preuves JSON et journaux aux détails.
+
+Validation locale : 61 tests sans appels fournisseur, dont reprise, arrêt,
+preuves de contrôle, effets des commandes, scheduler et rendu Streamlit.
+Aucun gain de facture Bedrock n'est annoncé sans mesure sur des tâches réelles.

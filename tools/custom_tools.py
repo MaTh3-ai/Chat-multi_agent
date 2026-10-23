@@ -16,6 +16,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from core.command_journal import record_command
+from core.agent_runtime import CURRENT_EXECUTION, command_category, path_lock, workspace_mutation, snapshot_files
 
 
 # -------------------------------------------------------------------
@@ -96,7 +97,7 @@ MAX_LIST_RESULTS = 150
 MAX_TEXT_FILE_SIZE_BYTES = 10 * 1024 * 1024
 MAX_COMMAND_TIMEOUT_SECONDS = 120
 MAX_COMMAND_OUTPUT_CHARACTERS = 20_000
-ALLOWED_COMMANDS = frozenset({"python", "python.exe", "pytest", "py", "ruff"})
+ALLOWED_COMMANDS = frozenset({"python", "python.exe", "python3", "pytest", "py", "ruff", "node", "npm", "pnpm", "yarn", "tsc", "git", "rg"})
 
 ALLOWED_TEXT_EXTENSIONS = {
     ".txt",
@@ -333,6 +334,9 @@ def read_text_excerpt(
         min(length, MAX_READ_CHARACTERS),
     )
 
+    session = CURRENT_EXECUTION.get()
+    if session is not None:
+        session.observe(path)
     with path.open(
         "r",
         encoding="utf-8",
@@ -739,99 +743,20 @@ def lire_fichier(
     debut: int = 0,
     longueur: int = DEFAULT_READ_CHARACTERS,
 ) -> str:
+    """Lit un extrait par caractères ; retourne contenu, pagination et empreinte.
+
+    Utilise lire_extraits_fichiers pour lire plusieurs plages de lignes en un appel.
     """
-    Lit un extrait d'un fichier texte du workspace.
-
-    Le chemin doit être relatif au workspace.
-
-    Le paramètre debut indique la position du premier caractère.
-    Le paramètre longueur indique le nombre maximal de caractères.
-
-    La lecture est limitée à 40 000 caractères par appel. Demande d'emblée
-    la tranche dont tu as besoin plutôt que d'enchaîner de petites lectures :
-    chaque appel supplémentaire est réinjecté dans le contexte.
-    """
-
     try:
-        path = resolve_workspace_path(
-            chemin
-        )
-
-    except WorkspaceSecurityError as error:
-        return f"Accès refusé : {error}"
-
-    if not path.exists():
-        return (
-            f"Fichier introuvable : {chemin}\n"
-            "Utilise lister_fichiers pour obtenir "
-            "le chemin exact."
-        )
-
-    if not path.is_file():
-        return (
-            f"Le chemin n'est pas un fichier : "
-            f"{chemin}"
-        )
-
-    try:
-        validate_text_file(path)
-
-    except UnsupportedFileTypeError as error:
-        return str(error)
-
-    try:
-        file_size = path.stat().st_size
-
-    except OSError as error:
-        return (
-            f"Impossible d'obtenir la taille du fichier "
-            f"{chemin} : {error}"
-        )
-
-    if file_size > MAX_TEXT_FILE_SIZE_BYTES:
-        return (
-            f"Lecture refusée : le fichier {chemin} "
-            f"pèse {format_file_size(file_size)}. "
-            "La limite de lecture directe est de "
-            f"{format_file_size(MAX_TEXT_FILE_SIZE_BYTES)}."
-        )
-
-    try:
-        excerpt, end_position, has_more = (
-            read_text_excerpt(
-                path=path,
-                start=debut,
-                length=longueur,
-            )
-        )
-
-    except OSError as error:
-        return (
-            f"Impossible de lire le fichier "
-            f"{chemin} : {error}"
-        )
-
-    if not excerpt:
-        return (
-            f"Aucun contenu trouvé dans {chemin} "
-            f"à partir du caractère {max(0, debut)}."
-        )
-
-    continuation_message = (
-        "Il reste du contenu. Pour continuer, appelle "
-        f"lire_fichier avec debut={end_position}."
-        if has_more
-        else "Fin du fichier atteinte."
-    )
-
-    return (
-        f"Fichier : {get_relative_path(path)}\n"
-        f"Taille : {format_file_size(file_size)}\n"
-        f"Extrait : caractères "
-        f"{max(0, debut)} à {end_position}\n"
-        f"{continuation_message}\n\n"
-        f"{excerpt}"
-    )
+        path = resolve_workspace_path(chemin)
+        with path_lock(path):
+            result = read_workspace_file(chemin, debut, longueur)
+            if result.get("ok"):
+                import hashlib
+                result["content_hash"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return json.dumps(result, ensure_ascii=False)
+    except (OSError, ValueError) as error:
+        return json.dumps({"ok": False, "path": chemin, "error": str(error)}, ensure_ascii=False)
 
 
 # -------------------------------------------------------------------
@@ -961,6 +886,7 @@ def rechercher_dans_fichiers(
 
 
 @tool
+@workspace_mutation
 def executer_commande_controlee(
     commande: list[str],
     dossier: str = ".",
@@ -984,6 +910,10 @@ def executer_commande_controlee(
         record_command(command=commande, cwd=dossier, error=message)
         return json.dumps({"ok": False, "error": message})
     started = time.monotonic()
+    started_at_ns = time.time_ns()
+    session = CURRENT_EXECUTION.get()
+    before = snapshot_files(WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES) if session else {}
+    failure = None
     try:
         working_directory = resolve_workspace_path(dossier)
         if not working_directory.is_dir():
@@ -1008,7 +938,8 @@ def executer_commande_controlee(
             error=message,
             duration_seconds=time.monotonic() - started,
         )
-        return json.dumps({"ok": False, "error": message}, ensure_ascii=False)
+        failure = message
+        completed = subprocess.CompletedProcess(commande, -1, "", message)
     stdout = (completed.stdout or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
     stderr = (completed.stderr or "")[-MAX_COMMAND_OUTPUT_CHARACTERS:]
     record_command(
@@ -1019,9 +950,34 @@ def executer_commande_controlee(
         stderr=stderr,
         duration_seconds=time.monotonic() - started,
     )
+    after = snapshot_files(WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES) if session else {}
+    changed_files = []
+    if session:
+        for relative in sorted(before.keys() | after.keys()):
+            if before.get(relative) == after.get(relative):
+                continue
+            record = {"ok": True, "applied": True, "path": relative,
+                      "content_hash": after.get(relative), "deleted": relative not in after,
+                      "completed_at_ns": time.time_ns(), "via": "command"}
+            session.record_write(session.operation_key("command_effect", {"command": commande, "record": record}), record)
+            if relative in after:
+                session.read_versions[str(resolve_workspace_path(relative))] = after[relative]
+            changed_files.append(record)
+    # A separate testing worker validates project inputs, not only its own
+    # writes. Include configuration, test files and newly created sources.
+    checked_files = after if session and before == after else {}
     return json.dumps({
         "ok": completed.returncode == 0,
         "returncode": completed.returncode,
+        "category": command_category(commande),
+        "command": commande,
+        "checked_files": checked_files,
+        "started_at_ns": started_at_ns,
+        "completed_at_ns": time.time_ns(),
+        "stable_during_check": before == after,
+        "files": changed_files,
+        "error": failure,
+        "effects_uncertain": bool(failure),
         "cwd": get_relative_path(working_directory),
         "stdout": stdout,
         "stderr": stderr,
@@ -1032,6 +988,88 @@ def executer_commande_controlee(
 # Liste des outils exportés
 # -------------------------------------------------------------------
 
+@tool
+def lire_extraits_fichiers(extraits: list[dict[str, str | int]]) -> str:
+    """Lit plusieurs extraits en un appel : [{chemin, debut_ligne?, fin_ligne?}].
+
+    Retourne chemins, numéros de ligne et empreintes ; budget total 40000 caractères.
+    """
+    results = []
+    remaining = MAX_READ_CHARACTERS
+    for request in extraits[:12]:
+        if remaining <= 0:
+            break
+        name = str(request.get("chemin", ""))
+        try:
+            path = resolve_workspace_path(name)
+            validate_text_file(path)
+            if path.stat().st_size > MAX_TEXT_FILE_SIZE_BYTES:
+                raise ValueError("Fichier trop volumineux")
+            start = max(1, int(request.get("debut_ligne", 1)))
+            end = max(start, int(request.get("fin_ligne", start + 199)))
+            with path_lock(path):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                session = CURRENT_EXECUTION.get()
+                if session is not None:
+                    session.observe(path)
+            import hashlib
+            lines = text.splitlines()
+            selected = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines) if start <= i + 1 <= end)
+            clipped = selected[:remaining]
+            remaining -= len(clipped)
+            results.append({"path": name, "ok": True, "content": clipped,
+                            "content_hash": hashlib.sha256(text.encode()).hexdigest(),
+                            "truncated": len(clipped) < len(selected), "total_lines": len(lines)})
+        except (OSError, ValueError, TypeError) as error:
+            results.append({"path": name, "ok": False, "error": str(error)})
+    return json.dumps({"files": results, "requests_omitted": max(0, len(extraits) - len(results))}, ensure_ascii=False)
+
+
+@tool
+def consulter_diff(chemin: str = ".") -> str:
+    """Affiche les différences Git du workspace (sortie limitée, sans modification)."""
+    path = resolve_workspace_path(chemin)
+    session = CURRENT_EXECUTION.get()
+    if session is not None:
+        from tools.write_tools import _get_proposal
+        changes = []
+        for relative, record in session.writes.items():
+            if chemin != "." and resolve_workspace_path(relative) != path:
+                continue
+            try:
+                proposal = _get_proposal(record["proposal_id"])
+                changes.append({"path": relative, "diff": proposal.get("diff", "")})
+            except (KeyError, RuntimeError):
+                continue
+        if changes:
+            text = json.dumps({"ok": True, "changes": changes}, ensure_ascii=False)
+            if len(text) <= MAX_COMMAND_OUTPUT_CHARACTERS:
+                return text
+            return json.dumps({"ok": True, "diff": "\n".join(item["diff"] for item in changes)[:MAX_COMMAND_OUTPUT_CHARACTERS],
+                               "truncated": True}, ensure_ascii=False)
+    completed = subprocess.run(["git", "diff", "--no-ext-diff", "--no-textconv", "--", str(path)],
+                               cwd=WORKSPACE_ROOT, capture_output=True, text=True, timeout=30, check=False)
+    return json.dumps({"ok": completed.returncode == 0, "returncode": completed.returncode,
+                       "diff": completed.stdout[:MAX_COMMAND_OUTPUT_CHARACTERS],
+                       "truncated": len(completed.stdout) > MAX_COMMAND_OUTPUT_CHARACTERS,
+                       "error": completed.stderr[:1000]}, ensure_ascii=False)
+
+
+@tool
+def lire_resultat_tache(identifiant: str, debut: int = 0, longueur: int = 8000) -> str:
+    """Lit à la demande le livrable complet d'une tâche dépendante, sans le régénérer."""
+    session = CURRENT_EXECUTION.get()
+    result = session.artifacts.get(identifiant) if session else None
+    if result is None:
+        return json.dumps({"ok": False, "error": "Livrable indisponible ou hors dépendances."})
+    start = max(0, debut)
+    end = start + max(1, min(longueur, MAX_READ_CHARACTERS))
+    return json.dumps({"ok": True, "task": identifiant, "content": result[start:end],
+                       "has_more": end < len(result), "next": min(end, len(result))}, ensure_ascii=False)
+
+
+# Execution tools are deliberately separate: a reader cannot run arbitrary
+# Python/Node or Git commands, which can themselves modify files.
 READ_ONLY_TOOLS = [
     informations_workspace,
     lister_fichiers,
@@ -1039,5 +1077,9 @@ READ_ONLY_TOOLS = [
     explorer_workspace_cible,
     lire_fichier,
     rechercher_dans_fichiers,
-    executer_commande_controlee,
+    lire_extraits_fichiers,
+    consulter_diff,
+    lire_resultat_tache,
 ]
+
+EXECUTION_TOOLS = [executer_commande_controlee]

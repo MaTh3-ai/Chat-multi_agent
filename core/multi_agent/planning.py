@@ -11,10 +11,10 @@ from core.models import get_tier
 from core.multi_agent.roles import ASSIGNABLE_TIERS
 
 MAX_TASKS = 24
-MIN_TASKS = 3
+MIN_TASKS = 1
 MAX_TEXT_LENGTH = 30_000
 MAX_FIELD_LENGTH = 8_000
-VALID_CAPABILITIES = {"auto", "read", "propose_write", "generate"}
+VALID_CAPABILITIES = {"auto", "read", "write", "execute", "propose_write", "generate"}
 VALID_DEPENDENCY_STATES = {"completed", "applied", "tested", "verified"}
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # Défauts JSON récurrents des sorties de modèles.
@@ -54,12 +54,10 @@ def estimate_plan_cost(ledger: TaskLedger) -> int:
     total = 0
     for task in ledger.tasks:
         tier_cost = get_tier(task.assigned_tier)["relative_cost"]
-        total += tier_cost * (
-            1 + max(0, int(getattr(task, "max_retries", 1)))
-            + max(0, int(getattr(task, "max_escalations", 1)))
-        )
+        retries_per_run = 1 + max(0, int(getattr(task, "max_retries", 1)))
+        total += tier_cost * retries_per_run
         if task.requires_review:
-            total += tier_cost
+            total += get_tier("fast" if task.assigned_tier == "nano" else task.assigned_tier)["relative_cost"]
     return total
 
 
@@ -150,10 +148,8 @@ def parse_plan(raw: str) -> dict[str, Any]:
         )
     if len(tasks) < MIN_TASKS:
         raise PlanError(
-            f"Le plan doit contenir au moins {MIN_TASKS} tâches. Décompose "
-            "systématiquement en : (1) analyse/consultation préalable, "
-            "(2) production du livrable, (3) vérification indépendante. "
-            f"Reçu : {len(tasks)}. Crée davantage de tâches distinctes.",
+            f"Le plan doit contenir au moins {MIN_TASKS} tâche. "
+            f"Reçu : {len(tasks)}.",
             semantic=True,
         )
     if len(tasks) > MAX_TASKS:
@@ -365,23 +361,22 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
             requires_review = False
         review_count += int(requires_review)
 
-        enriched_description = (
-            f"{description}\n\nSortie attendue : {expected_output}"
-            "\n\nCritères d'acceptation :\n"
-            + "\n".join(f"- {criterion}" for criterion in criteria)
-        )
-        if requires_review:
-            enriched_description += (
-                "\n\nRevue humaine ou critique ciblée requise avant synthèse."
-            )
+        command = raw_task.get("command", [])
+        if not isinstance(command, list) or any(not isinstance(part, str) or not part.strip() for part in command):
+            raise PlanError(f"{where}: command doit être une liste d'arguments.")
+        if command and capabilities != ["execute"]:
+            raise PlanError(f"{where}: command exige capabilities=[execute].", semantic=True)
 
         ledger.add_task(
             Task(
                 id=identifiers[index],
                 title=title,
-                description=enriched_description,
+                description=description,
+                expected_output=expected_output,
+                acceptance_criteria=criteria,
                 assigned_tier=tier,
                 capabilities=capabilities,
+                command=command,
                 max_retries=max_retries,
                 max_escalations=max_escalations,
                 requires_review=requires_review,
@@ -397,7 +392,7 @@ def build_ledger(raw_plan: str) -> tuple[TaskLedger, PlanReport]:
 
     estimated_cost_units = estimate_plan_cost(ledger)
     validation_warnings = [
-        "L'estimation suppose le nombre maximal de reprises et d'escalades ; "
+        "L'estimation relative compte les reprises et les revues demandées ; "
         "le coût réel peut être inférieur.",
     ]
     return ledger, PlanReport(

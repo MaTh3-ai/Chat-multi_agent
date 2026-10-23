@@ -83,15 +83,9 @@ class PlanPreviewTest(unittest.TestCase):
             }
         }
         _apply_edits(ledger, edits)
-        self.assertEqual(
-            ledger.tasks[0].description,
-            _enrich_description(
-                "Lire les éléments.",
-                "une analyse",
-                ["faits vérifiables"],
-                True,
-            ),
-        )
+        self.assertEqual(ledger.tasks[0].description, "Lire les éléments.")
+        self.assertEqual(ledger.tasks[0].expected_output, "une analyse")
+        self.assertEqual(ledger.tasks[0].acceptance_criteria, ["faits vérifiables"])
 
     def test_worker_output_target_is_explicitly_non_blocking(self):
         prompt = worker_task_prompt(

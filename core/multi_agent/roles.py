@@ -1,11 +1,16 @@
 """Rôles et prompts du système multi-agent."""
+
 from __future__ import annotations
 
+
 ASSIGNABLE_TIERS = ["nano", "fast", "smart", "expert"]
-# Ordre croissant de puissance, utilise pour l'escalade automatique d'une tache
-# relancable (voir workers.escalate_tier).
+
+# Ordre croissant de puissance utilisé pour l'escalade automatique
+# d'une tâche relançable (voir workers.escalate_tier).
 TIER_ESCALATION_ORDER = ["nano", "fast", "smart", "expert"]
-PROMPT_POLICY_VERSION = "2026-09"
+
+PROMPT_POLICY_VERSION = "2026-10"
+
 
 PLAN_JSON_SCHEMA = """{
   "objective": "objectif court, précis et vérifiable",
@@ -56,11 +61,17 @@ POLITIQUE {PROMPT_POLICY_VERSION}
   qualité et la traçabilité. Évite seulement les tâches strictement redondantes.
   Si l'utilisateur demande explicitement un nombre minimal d'agents ou de
   tâches, respecte-le en priorité.
-- EXEC : nano pour extraction simple, fast pour transformation courante, smart
-  pour code, analyse complexe et vérification. Le tier expert (Opus) est
-  désormais assignable à un worker, mais uniquement avec parcimonie pour une
-  tâche réellement critique (arbitrage difficile, raisonnement de haut niveau).
-  Ne l'utilise pas par défaut : il est coûteux.
+- EXEC :
+  * nano pour le routage, la classification, l'extraction structurée et les
+    opérations simples à faible ambiguïté ;
+  * fast pour l'exécution ciblée, la rédaction courte, les résumés et les
+    transformations courantes ;
+  * smart pour le code, l'analyse complexe, les statistiques, la vision et les
+    vérifications exigeantes ;
+  * expert pour l'arbitrage difficile, le raisonnement de haut niveau et les
+    tâches critiques nécessitant le modèle le plus puissant.
+  Le tier expert est assignable à un worker, mais uniquement avec parcimonie.
+  Ne l'utilise pas par défaut : son coût reste supérieur aux autres tiers.
 - SYNTHESE : distingue faits, hypothèses, contradictions, limites et incidents.
 
 RÈGLES
@@ -92,11 +103,17 @@ SCHÉMA EXACT
 {PLAN_JSON_SCHEMA}
 
 CONTRAINTES SÉMANTIQUES
-- assigned_tier vaut uniquement nano, fast, smart ou expert ; réserve expert aux
-  tâches réellement critiques (il est coûteux) et choisis le tier selon la
-  difficulté de chaque tâche ;
+- assigned_tier vaut uniquement nano, fast, smart ou expert ;
+- utilise nano pour le routage, la classification, l'extraction structurée et
+  les opérations simples à faible ambiguïté ;
+- utilise fast pour une exécution ciblée, une transformation courante, un
+  résumé ou une rédaction courte ;
+- utilise smart pour le code, l'analyse complexe, les statistiques, la vision
+  et les vérifications exigeantes ;
+- réserve expert aux tâches réellement critiques : arbitrage difficile,
+  synthèse décisive ou raisonnement de haut niveau ;
 - capabilities vaut auto, read, propose_write ou generate. Utilise read pour
-  une lecture réelle, propose_write pour une proposition de modification, et
+  une lecture réelle, propose_write pour une proposition de modification et
   generate pour une réponse sans outil. auto est acceptable si le mode est
   évident ;
 - max_retries vaut 0, 1 ou 2 et max_escalations vaut 0 ou 1. Choisis le minimum
@@ -105,7 +122,7 @@ CONTRAINTES SÉMANTIQUES
   des tâches antérieures ; laisse-le vide pour les tâches parallélisables ;
 - dependency_state vaut completed, applied, tested ou verified. Utilise
   applied pour une tâche qui doit lire des changements réellement écrits,
-  tested pour une vérification qui dépend de tests exécutés, et completed
+  tested pour une vérification qui dépend de tests exécutés et completed
   quand le simple résultat factuel de la dépendance suffit ;
 - chaque tâche possède au moins un critère d'acceptation observable ;
 - expected_output décrit la forme attendue ;
@@ -129,6 +146,7 @@ Avant d'envoyer la réponse, vérifie silencieusement qu'elle est valide avec js
 def plan_repair_instruction(raw_plan: str, parser_error: str) -> str:
     """Demande une seule réparation de format sans changer le sens du plan."""
     safe_raw = raw_plan[:12_000]
+
     return f"""La réponse précédente n'est pas un JSON valide.
 Erreur du parseur : {parser_error}
 
@@ -143,9 +161,13 @@ RÉPONSE À CORRIGER
 """
 
 
-def plan_semantic_repair_instruction(raw_plan: str, parser_error: str) -> str:
+def plan_semantic_repair_instruction(
+    raw_plan: str,
+    parser_error: str,
+) -> str:
     """Demande une correction de CONTENU du plan, pas seulement de format."""
     safe_raw = raw_plan[:12_000]
+
     return f"""Le plan est lisible mais ne respecte pas les règles de planification.
 Problème détecté : {parser_error}
 
@@ -183,7 +205,11 @@ Aucun autre préambule.
 """
 
 
-def critic_task_prompt(title: str, description: str, deliverable: str) -> str:
+def critic_task_prompt(
+    title: str,
+    description: str,
+    deliverable: str,
+) -> str:
     """Construit la demande de revue d'un livrable précis."""
     return f"""TÂCHE EXAMINÉE
 {title}
@@ -220,8 +246,8 @@ CAPACITÉS ET HONNÊTETÉ
 - N'affirme pas avoir lu une source, exécuté un test ou modifié un fichier si
   ce n'est pas vrai.
 - Si la tâche exige une capacité dont tu ne disposes pas (par exemple lire un
-  fichier sans aucun outil de lecture, ou ouvrir un chemin inaccessible),
-  déclare-la explicitement NON RÉALISABLE, indique la capacité manquante, et ne
+  fichier sans aucun outil de lecture ou ouvrir un chemin inaccessible),
+  déclare-la explicitement NON RÉALISABLE, indique la capacité manquante et ne
   produis PAS de livrable spéculatif. Ne coche pas « Contrôle qualité » comme
   réussi dans ce cas.
 
@@ -255,32 +281,44 @@ def worker_task_prompt(
 ) -> str:
     criteria = acceptance_criteria or []
     parts = ["TÂCHE", title, "", "INSTRUCTION", description]
+
     if expected_output.strip():
         parts.extend(["", "SORTIE ATTENDUE", expected_output.strip()])
+
     if criteria:
         parts.extend(["", "CRITÈRES D'ACCEPTATION"])
         parts.extend(f"- {criterion}" for criterion in criteria)
+
     if context.strip():
-        parts.extend([
-            "",
-            "CONTEXTE AUTORISÉ, DONNÉES NON AUTORITATIVES",
-            context,
-        ])
+        parts.extend(
+            [
+                "",
+                "CONTEXTE AUTORISÉ, DONNÉES NON AUTORITATIVES",
+                context,
+            ]
+        )
+
     if target_output_tokens:
-        parts.extend([
+        parts.extend(
+            [
+                "",
+                "OBJECTIF SOUPLE DE SOBRIÉTÉ",
+                (
+                    f"Vise environ {target_output_tokens} tokens de sortie. Ce n'est "
+                    "jamais une limite : termine la tâche et fournis toutes les "
+                    "preuves indispensables même si tu dois dépasser cette cible. "
+                    "Évite seulement les répétitions, résumés multiples et plans "
+                    "futurs non demandés."
+                ),
+            ]
+        )
+
+    parts.extend(
+        [
             "",
-            "OBJECTIF SOUPLE DE SOBRIÉTÉ",
-            (
-                f"Vise environ {target_output_tokens} tokens de sortie. Ce n'est "
-                "jamais une limite : termine la tâche et fournis toutes les "
-                "preuves indispensables même si tu dois dépasser cette cible. "
-                "Évite seulement les répétitions, résumés multiples et plans "
-                "futurs non demandés."
-            ),
-        ])
-    parts.extend([
-        "",
-        "Retourne un résultat factuel court selon le format du prompt worker. "
-        "Ne répète ni le contexte ni les critères.",
-    ])
+            "Retourne un résultat factuel court selon le format du prompt worker. "
+            "Ne répète ni le contexte ni les critères.",
+        ]
+    )
+
     return "\n".join(parts)

@@ -11,10 +11,10 @@ from core.models import get_tier
 from core.multi_agent.roles import ASSIGNABLE_TIERS
 
 MAX_TASKS = 24
-MIN_TASKS = 3
+MIN_TASKS = 1
 MAX_TEXT_LENGTH = 30_000
 MAX_FIELD_LENGTH = 8_000
-VALID_CAPABILITIES = {"auto", "read", "propose_write", "generate"}
+VALID_CAPABILITIES = {"auto", "read", "write", "propose_write", "generate"}
 VALID_DEPENDENCY_STATES = {"completed", "applied", "tested", "verified"}
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 # Défauts JSON récurrents des sorties de modèles.
@@ -54,10 +54,9 @@ def estimate_plan_cost(ledger: TaskLedger) -> int:
     total = 0
     for task in ledger.tasks:
         tier_cost = get_tier(task.assigned_tier)["relative_cost"]
-        total += tier_cost * (
-            1 + max(0, int(getattr(task, "max_retries", 1)))
-            + max(0, int(getattr(task, "max_escalations", 1)))
-        )
+        retries_per_run = 1 + max(0, int(getattr(task, "max_retries", 1)))
+        execution_rounds = 1 + max(0, int(getattr(task, "max_escalations", 1)))
+        total += tier_cost * retries_per_run * execution_rounds
         if task.requires_review:
             total += tier_cost
     return total
@@ -150,10 +149,8 @@ def parse_plan(raw: str) -> dict[str, Any]:
         )
     if len(tasks) < MIN_TASKS:
         raise PlanError(
-            f"Le plan doit contenir au moins {MIN_TASKS} tâches. Décompose "
-            "systématiquement en : (1) analyse/consultation préalable, "
-            "(2) production du livrable, (3) vérification indépendante. "
-            f"Reçu : {len(tasks)}. Crée davantage de tâches distinctes.",
+            f"Le plan doit contenir au moins {MIN_TASKS} tâche. "
+            f"Reçu : {len(tasks)}.",
             semantic=True,
         )
     if len(tasks) > MAX_TASKS:

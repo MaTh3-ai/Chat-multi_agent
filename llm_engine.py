@@ -18,7 +18,7 @@ from core.models import (
 )
 from core.memory_tools import MEMORY_TOOLS
 from tools.custom_tools import READ_ONLY_TOOLS
-from tools.write_tools import WRITE_PROPOSAL_TOOLS
+from tools.write_tools import DIRECT_WRITE_TOOLS, WRITE_PROPOSAL_TOOLS
 
 READ_TOOLS = list(READ_ONLY_TOOLS)
 PROPOSAL_TOOLS = list(WRITE_PROPOSAL_TOOLS)
@@ -31,11 +31,9 @@ TOOLS = READ_TOOLS + PROPOSAL_TOOLS + MEMORY_TOOL_LIST
 # la phase DISCOVERY.
 WORKSPACE_READER_TOOLS = list(READ_ONLY_TOOLS)
 
-# Editeur de workspace dedie au mode multi-agent : consultation + creation de
-# PROPOSITIONS (proposer_*), exactement comme le chatbot cote app.py. Aucune
-# ecriture directe : les propositions restent soumises a approbation Streamlit.
-# Ce jeu est confie a un worker dont la tache exige de modifier un fichier.
-WORKSPACE_EDITOR_TOOLS = list(READ_ONLY_TOOLS) + list(WRITE_PROPOSAL_TOOLS)
+# Editeur multi-agent : lecture, modifications directes sauvegardees et
+# controles. Le chatbot classique conserve son circuit de propositions.
+WORKSPACE_EDITOR_TOOLS = list(READ_ONLY_TOOLS) + list(DIRECT_WRITE_TOOLS)
 
 CONNECT_TIMEOUT_SECONDS = int(os.getenv("BEDROCK_CONNECT_TIMEOUT", "15"))
 READ_TIMEOUT_SECONDS = int(os.getenv("BEDROCK_READ_TIMEOUT", "300"))
@@ -142,16 +140,11 @@ def get_workspace_editor_agent(
     temperature: float | int | None = None,
     max_tokens: int | None = None,
 ):
-    """Cree un agent LangGraph capable de CONSULTER et de PROPOSER des modifications.
+    """Cree un agent multi-agent de lecture et d'ecriture directe.
 
-    Cet agent expose WORKSPACE_EDITOR_TOOLS : les outils de consultation plus
-    les outils de proposition (proposer_remplacement_cible, proposer_insertion_ciblee,
-    proposer_suppression_ciblee, proposer_modification_fichier). Il fonctionne
-    comme le chatbot : il ne peut jamais ecrire directement, il ne fait que
-    creer des propositions soumises a approbation dans Streamlit.
-
-    Il est confie a un worker dont la tache exige de modifier un fichier
-    (voir core.multi_agent.workers._task_requires_writing).
+    Les écritures restent confinées au workspace, sont validées, sauvegardées
+    et appliquées immédiatement. Le chatbot classique continue d'utiliser ses
+    propres outils de proposition soumis à approbation.
     """
     model = create_chat_model(model_alias, temperature, max_tokens)
     tools = _deduplicate_tools(WORKSPACE_EDITOR_TOOLS)

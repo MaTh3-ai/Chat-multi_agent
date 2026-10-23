@@ -93,7 +93,8 @@ class PlanPreviewTest(unittest.TestCase):
             "Terminer l'analyse.",
             target_output_tokens=1200,
         )
-        self.assertIn("Vise environ 1200 tokens", prompt)
+        self.assertIn("1200 tokens", prompt)
+        self.assertIn("pas une longueur à atteindre", prompt)
         self.assertIn("Ce n'est jamais une limite", prompt)
         self.assertIn("termine la tâche", prompt)
 

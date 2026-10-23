@@ -629,3 +629,20 @@ réduction chiffrée de facture n’est supposée sans mesure sur des tâches r�
 Validation locale : 61 tests sans appels fournisseur, dont reprise, arrêt,
 preuves de contrôle, effets des commandes, scheduler et rendu Streamlit.
 Aucun gain de facture Bedrock n'est annoncé sans mesure sur des tâches réelles.
+
+
+### Consignes proportionnées au travail demandé
+
+Le chef produit un contrat compact : action et périmètre dans `description`,
+résultats observables dans `acceptance_criteria`, forme dans `expected_output`.
+Il ne doit pas ajouter d'audit ou de livrable générique au besoin utilisateur.
+Les options par défaut sont facultatives, sans instruction contradictoire de
+toutes les émettre. La construction du prompt worker supprime uniquement les
+champs entiers strictement identiques (espaces normalisés), jamais une contrainte
+par ressemblance ou sous-chaîne. Le repère de 1 200 jetons n'est pas une longueur
+à atteindre ; analyses et code gardent la longueur nécessaire au besoin.
+
+La compaction des instructions statiques est mesurable en caractères. Son effet
+sur les jetons, la latence et la longueur des réponses nécessite des appels réels ;
+un timeout ne permet pas de conclure à un excès de réflexion. Le client ne règle
+pas actuellement un budget de raisonnement spécifique au fournisseur.

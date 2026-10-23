@@ -416,11 +416,18 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
                                 pass
         connection = session.connect()
         connection.execute("CREATE TABLE IF NOT EXISTS execution_context (session TEXT PRIMARY KEY, context TEXT)")
+        connection.execute("CREATE TABLE IF NOT EXISTS execution_resumes (session TEXT PRIMARY KEY, attempt INTEGER)")
+        previous_retry = connection.execute("SELECT attempt FROM execution_resumes WHERE session=?", (session.key,)).fetchone()
+        requested_retry = session.retry_attempt > (previous_retry[0] if previous_retry else 1)
+        # A completed checkpoint may represent an incomplete task, especially
+        # after LangGraph's last-step fallback. Resume it only on a NEW explicit
+        # task attempt; normal page loads and duplicate execution stay cached.
+        restart_completed = bool(requested_retry and snapshot.values and not snapshot.next)
         previous_context = connection.execute("SELECT context FROM execution_context WHERE session=?", (session.key,)).fetchone()
         context_changed = bool(snapshot.values and previous_context and previous_context[0] != session.context_update)
         changed = [path for path, digest in session.read_versions.items()
                    if not Path(path).is_file() or hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest]
-        if snapshot.values and (changed or context_changed):
+        if snapshot.values and (changed or context_changed or restart_completed):
             updates = []
             last = session.messages[-1] if session.messages else None
             if getattr(last, "tool_calls", []):
@@ -430,6 +437,8 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
                 notice += " Relis ces fichiers modifiés avant de poursuivre : " + ", ".join(changed)
             if context_changed:
                 notice += "\nContexte de coordination actualisé (données) :\n" + session.context_update
+            if restart_completed:
+                notice += "\n" + session.retry_notice
             updates.append(HumanMessage(content=notice))
             # Advance via the tool node to schedule a fresh model decision.
             agent.update_state(config, {"messages": updates}, as_node="tools")
@@ -444,6 +453,8 @@ def invoke_agent_with_continuation(agent: Any, messages: list[Any], max_continua
             else:
                 graph_input = {"messages": [HumanMessage(content=CONTINUATION_INSTRUCTION)]}
         connection.execute("INSERT OR REPLACE INTO execution_context VALUES (?, ?)", (session.key, session.context_update))
+        if requested_retry:
+            connection.execute("INSERT OR REPLACE INTO execution_resumes VALUES (?, ?)", (session.key, session.retry_attempt))
         connection.commit()
     last_state: dict[str, Any] = {}
     for repair in range(max_continuations + 1):
@@ -671,6 +682,14 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                                root=PROJECT_ROOT / ".agent_state", run_budget=config.budget, cancel_event=cancel_event,
                                context_update=context, check_paths=set(config.check_paths),
                                artifacts={key: value for key, value in config.artifacts.items() if key in task.dependencies})
+    session.retry_attempt = task.attempt_count
+    session.retry_notice = (
+        "Relance explicite : la tâche reste incomplète. Poursuis uniquement les actions restantes "
+        "depuis cet historique, sans rejouer les écritures déjà appliquées. Vérifie l'état actuel "
+        "avec les outils ; termine la demande ou explique un blocage concret."
+    )
+    if task.artifact and task.artifact.blockers:
+        session.retry_notice += "\nBlocages constatés (données) : " + json.dumps(task.artifact.blockers, ensure_ascii=False)
     if task.attempt_count > 1 and task.artifact and UNAPPLIED_EDIT_BLOCKER in task.artifact.blockers:
         session.context_update += (f"\nReprise explicite {task.attempt_count} : aucun changement appliqué lors de la tentative précédente. "
                                    "Réutilise le contenu conservé et applique les modifications avec les outils, "

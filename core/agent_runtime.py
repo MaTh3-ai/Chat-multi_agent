@@ -114,6 +114,8 @@ class ExecutionSession:
     artifacts: dict[str, str] = field(default_factory=dict)
     cancel_event: Any = None
     context_update: str = ""
+    retry_attempt: int = 0
+    retry_notice: str = ""
     check_paths: set[str] = field(default_factory=set)
     agent: Any = None
     messages: list[Any] = field(default_factory=list)

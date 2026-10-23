@@ -723,3 +723,17 @@ dans la légende. Aucun prix AWS n'est déduit des unités relatives du catalogu
 Les tests de routage ne démontrent pas une économie monétaire ni une qualité
 équivalente : celles-ci se mesurent sur des demandes comparables en suivant
 les modèles, entrées/sorties/cache, reprises et taux d'achèvement.
+
+### Relance explicite d'un résultat partiel
+
+Une tâche « à revoir » peut avoir un checkpoint LangGraph terminal : le graphe
+s'est arrêté, mais la demande n'est pas achevée. Sa relance doit donc réactiver
+la décision du worker, au lieu de restituer le même ancien résultat.
+Le numéro de tentative du ledger est transmis à la session ; SQLite mémorise
+la dernière demande de reprise consommée. Un nouveau numéro réactive un graphe
+terminal avec l'historique, les preuves, les écritures et les blocages conservés.
+Un graphe avec des nœuds en attente reprend ces nœuds. Réexécuter la même
+tentative ne déclenche pas de nouvelle inférence si le checkpoint est terminé.
+Aucun identifiant d'exécution n'est renouvelé et les écritures ne sont pas rejouées.
+Le scénario de régression vérifie une modification partielle, sa continuation
+après relance, puis une consultation sans appel supplémentaire ; aucun appel AWS.

@@ -14,7 +14,7 @@ boto3>=1.34
 botocore>=1.34
 
 # Couche LangChain / Bedrock Converse
-langchain-aws>=0.2
+langchain-aws>=1.9,<2
 langchain-core>=0.3
 
 # Orchestration d'agents (agent ReAct de l'assistant principal)

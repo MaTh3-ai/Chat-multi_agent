@@ -40,6 +40,7 @@ from core.multi_agent.roles import (
     plan_repair_instruction,
     plan_semantic_repair_instruction,
 )
+from core.multi_agent.coordination import UNAPPLIED_EDIT_BLOCKER
 from core.multi_agent.workers import (
     MAX_PARALLEL_WORKERS,
     WorkerResult,
@@ -1190,6 +1191,8 @@ class ChefDeProjet:
         # A single finished textual deliverable needs no paid rewrite. Code
         # deliveries already contain all facts needed for a concise response.
         artifacts = [task.artifact for task in self.ledger.tasks if task.artifact]
+        if any(UNAPPLIED_EDIT_BLOCKER in artifact.blockers for artifact in artifacts):
+            return self._save_final(self._execution_summary())
         open_conflicts = any(not item.get("resolved") for item in self.ledger.contradictions)
         if len(self.ledger.tasks) == 1 and artifacts and artifacts[0].result and not (
             failed or blocked or cancelled or to_review or open_conflicts
@@ -1341,7 +1344,10 @@ Principes :
                 elif written:
                     lines.append("  Aucun test exécuté ; les contrôles de syntaxe ne valent pas test fonctionnel.")
                 if artifact.result:
-                    lines.append(artifact.result)
+                    if UNAPPLIED_EDIT_BLOCKER in artifact.blockers:
+                        lines.append("  Contenu généré conservé dans le détail de la tâche ; aucune écriture prouvée.")
+                    else:
+                        lines.append(artifact.result)
             else:
                 lines.append(f"- {task.title} : {task.status}.")
             if task.error:

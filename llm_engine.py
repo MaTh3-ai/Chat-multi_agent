@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import json
 import hashlib
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Iterable
 
 import boto3
@@ -38,7 +38,7 @@ WORKSPACE_READER_TOOLS = list(READ_ONLY_TOOLS)
 WORKSPACE_EDITOR_TOOLS = list(READ_ONLY_TOOLS) + list(EXECUTION_TOOLS) + list(DIRECT_WRITE_TOOLS)
 
 
-def compact_duplicate_tool_results(state: dict[str, Any]) -> dict[str, Any]:
+def compact_duplicate_tool_results(state: dict[str, Any], *, preserve_prefix: bool = False) -> dict[str, Any]:
     """Replace only exact repeated tool outputs in the inference input.
 
     The full checkpoint remains untouched. Unique information is never cut.
@@ -46,7 +46,7 @@ def compact_duplicate_tool_results(state: dict[str, Any]) -> dict[str, Any]:
     from langchain_core.messages import ToolMessage
     seen: dict[tuple[str, str], str] = {}
     messages = list(state.get("messages", []))
-    for index in range(len(messages) - 1, -1, -1):
+    for index in (range(len(messages) - 1, -1, -1) if not preserve_prefix else []):
         message = messages[index]
         if not isinstance(message, ToolMessage) or not isinstance(message.content, str) or len(message.content) < 512:
             continue
@@ -121,6 +121,8 @@ def create_chat_model(
     model_alias: str | None = None,
     temperature: float | int | None = None,
     max_tokens: int | None = None,
+    *,
+    cache_for_agent: bool = False,
 ):
     """Construit ChatBedrockConverse a partir du registre central."""
     alias = model_alias or get_default_model_alias()
@@ -132,17 +134,21 @@ def create_chat_model(
     arguments: dict[str, Any] = {
         "client": create_bedrock_runtime_client(model_config["region"]),
         "model_id": model_config["model_id"],
+        "region_name": model_config["region"],
         "max_tokens": selected_max_tokens,
     }
     if selected_temperature is not None:
         arguments["temperature"] = selected_temperature
     model = ChatBedrockConverse(**arguments)
-    # Explicit opt-in: cache writes may cost more when prefixes are never
-    # reused. Keep provider/model eligibility under deployment configuration.
-    cached_aliases = {value.strip() for value in os.getenv("BEDROCK_PROMPT_CACHE_MODELS", "").split(",") if value.strip()}
+    # Cache only known compatible multi-call agent sessions by default. An
+    # explicit empty environment value disables it; single chief calls stay off.
+    configured = os.getenv("BEDROCK_PROMPT_CACHE_MODELS")
+    defaults = {"claude-sonnet-5.5", "claude-opus-5.5", "claude-haiku-4.5"}
+    cached_aliases = ({value.strip() for value in configured.split(",") if value.strip()}
+                      if configured is not None else defaults if cache_for_agent else set())
     if alias in cached_aliases:
         if not hasattr(model, "_apply_cache_points"):
-            raise ValueError("Mettre à jour langchain-aws pour activer le cache de prompts.")
+            raise ValueError("Mettre à jour langchain-aws>=1.9 pour le cache des agents, ou définir BEDROCK_PROMPT_CACHE_MODELS vide.")
         return model.bind(cache_control={"ttl": "5m"})
     return model
 
@@ -160,6 +166,15 @@ def _deduplicate_tools(tools: Iterable[Any]) -> list[Any]:
     return list(unique.values())
 
 
+def _agent_model_and_hook(model: Any, tools: list[Any]):
+    options = getattr(model, "kwargs", {})
+    cached = isinstance(options, dict) and bool(options.get("cache_control"))
+    if cached:
+        model = model.bound.bind_tools(tools).bind(**options)
+    hook = partial(compact_duplicate_tool_results, preserve_prefix=True) if cached else compact_duplicate_tool_results
+    return model, hook
+
+
 def get_bedrock_agent(
     model_alias: str | None = None,
     temperature: float | int | None = None,
@@ -169,7 +184,8 @@ def get_bedrock_agent(
     """Cree l'agent de chat. Aucun outil d'approbation ne lui est expose."""
     model = create_chat_model(model_alias, temperature, max_tokens)
     tools = _deduplicate_tools([*TOOLS, *(additional_tools or [])])
-    return create_react_agent(model=model, tools=tools)
+    model, hook = _agent_model_and_hook(model, tools)
+    return create_react_agent(model=model, tools=tools, pre_model_hook=hook)
 
 
 def get_workspace_reader_agent(
@@ -194,10 +210,11 @@ def get_workspace_reader_agent(
     Le Chef n'utilise donc pas cet agent LLM. Cette fabrique est conservee pour
     les usages hors mode multi-agent et pour les tests.
     """
-    model = create_chat_model(model_alias, temperature, max_tokens)
+    model = create_chat_model(model_alias, temperature, max_tokens, cache_for_agent=True)
     tools = _deduplicate_tools(WORKSPACE_READER_TOOLS + (list(EXECUTION_TOOLS) if allow_execution else []))
+    model, hook = _agent_model_and_hook(model, tools)
     return create_react_agent(model=model, tools=tools, checkpointer=checkpointer,
-                             pre_model_hook=compact_duplicate_tool_results,
+                             pre_model_hook=hook,
                              post_model_hook=guard_truncated_tool_calls)
 
 
@@ -213,10 +230,11 @@ def get_workspace_editor_agent(
     et appliquées immédiatement. Le chatbot classique continue d'utiliser ses
     propres outils de proposition soumis à approbation.
     """
-    model = create_chat_model(model_alias, temperature, max_tokens)
+    model = create_chat_model(model_alias, temperature, max_tokens, cache_for_agent=True)
     tools = _deduplicate_tools(WORKSPACE_EDITOR_TOOLS)
+    model, hook = _agent_model_and_hook(model, tools)
     return create_react_agent(model=model, tools=tools, checkpointer=checkpointer,
-                             pre_model_hook=compact_duplicate_tool_results,
+                             pre_model_hook=hook,
                              post_model_hook=guard_truncated_tool_calls)
 
 

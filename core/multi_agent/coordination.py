@@ -11,6 +11,8 @@ from functools import lru_cache
 
 from tools.custom_tools import WORKSPACE_ROOT, IGNORED_DIRECTORY_NAMES
 
+UNAPPLIED_EDIT_BLOCKER = "Aucune écriture prouvée : les modifications demandées restent à appliquer ou à justifier comme inutiles."
+
 ARTIFACT_STATES = (
     "observed",
     "proposed",

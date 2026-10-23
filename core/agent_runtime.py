@@ -92,7 +92,9 @@ class UsageRecorder(BaseCallbackHandler):
                 budget.output_tokens += int(usage.get("output_tokens") or 0)
                 details = usage.get("input_token_details") or {}
                 budget.cache_read_tokens += int(details.get("cache_read") or 0)
-                budget.cache_write_tokens += int(details.get("cache_creation") or 0)
+                budget.cache_write_tokens += int(details.get("cache_creation") or (
+                    (details.get("ephemeral_5m_input_tokens") or 0) +
+                    (details.get("ephemeral_1h_input_tokens") or 0)))
 
     def on_llm_error(self, error: BaseException, **kwargs: Any) -> None:
         # A timeout is not proof that the provider did not bill the call.

@@ -1064,7 +1064,10 @@ def _render_run_summary(chief) -> None:
         usage[0].metric("Appels modèles", summary.get("model_calls", 0))
         usage[1].metric("Tokens en entrée", summary.get("input_tokens", 0))
         usage[2].metric("Tokens en sortie", summary.get("output_tokens", 0))
-        st.caption(f"Cache : {summary.get('cache_read_tokens', 0)} tokens lus, "
+        ordinary = max(0, summary.get("input_tokens", 0) - summary.get("cache_read_tokens", 0)
+                       - summary.get("cache_write_tokens", 0))
+        st.caption(f"Entrées hors cache : {ordinary}. "
+                   f"Cache : {summary.get('cache_read_tokens', 0)} tokens lus, "
                    f"{summary.get('cache_write_tokens', 0)} écrits. Les prix dépendent du modèle.")
         rows = []
         for task in ledger.tasks:
@@ -1179,7 +1182,11 @@ def _render_task_board(chief) -> None:
                 st.caption(f"Role : {role}")
             artifact = getattr(task, "artifact", None)
             if artifact:
-                st.markdown(artifact.result or artifact.summary)
+                unapplied = any(value.startswith("Aucune écriture prouvée") for value in artifact.blockers)
+                st.markdown(artifact.summary if unapplied else artifact.result or artifact.summary)
+                if unapplied and artifact.result:
+                    with st.expander("Contenu généré non appliqué", expanded=False):
+                        st.code(artifact.result)
                 labels = {"observed": "Résultat produit", "applied": "Modifications enregistrées · contrôles non validés",
                           "tested": "Contrôles réussis sur la version observée", "proposed": "Modifications proposées"}
                 st.caption(labels.get(artifact.state, artifact.state))

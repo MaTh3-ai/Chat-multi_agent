@@ -563,8 +563,9 @@ répertoire de départ contrôlé ne constituent pas un bac à sable système.
 - Commandes de contrôle : Python, pytest, Ruff, Node, npm/pnpm/yarn, TypeScript,
   Git et rg, si disponibles sur la machine. Les vrais lecteurs et critiques
   n’ont pas accès à l’outil d’exécution ; les tâches `execute` le reçoivent.
-- Les résultats d’outils exactement répétés sont compactés automatiquement pour
-  l’inférence. Le contenu unique et les points de reprise complets sont préservés.
+- Sans cache, les résultats d’outils exactement répétés sont compactés pour
+  l’inférence. Avec cache, les anciens messages restent stables pour conserver
+  les préfixes réutilisables. Le contenu unique et les checkpoints sont préservés.
 - Un appel d’outil tronqué n’est pas exécuté. Seule l’action manquante est
   régénérée ; une simple troncature du rapport final ne déclenche pas de reprise.
 
@@ -578,10 +579,12 @@ Tests sans fournisseur ni appel payant : `python -m pytest -q` (pytest requis).
   budget connu ; `0` signifie non configuré. Il ne coupe pas une génération en
   cours et n’est pas un plafond de facturation strict avec des appels en vol.
 - `BEDROCK_SDK_TOTAL_MAX_ATTEMPTS` : défaut `1` ; le worker gère les reprises.
-- `BEDROCK_PROMPT_CACHE_MODELS` : liste d’alias séparés par des virgules, vide par
-  défaut. À activer uniquement après vérification du support modèle/région et
-  avec une version de langchain-aws prenant en charge `cache_control`. La durée
-  demandée est de cinq minutes ; les écritures de cache peuvent être payantes.
+- `BEDROCK_PROMPT_CACHE_MODELS` : si absente, cache de cinq minutes activé pour
+  les sessions d'agents Sonnet 5.5, Opus 5.5 et Haiku 4.5, dont le support est
+  documenté par AWS. Les appels simples du chef restent sans cache par défaut.
+  Une liste explicite remplace cette sélection ; une valeur vide désactive le
+  cache. Réinstaller les dépendances (`langchain-aws>=1.9,<2`). Les écritures
+  de cache ont un coût et les hits dépendent des préfixes et de leur durée de vie.
 
 Les métriques incluent les workers, l’entretien, la planification, la revue et
 la synthèse lorsqu’elle est nécessaire. Les reprises sont cumulées ; les tokens
@@ -664,3 +667,28 @@ L'interface présente les jetons cumulés, entrées, sorties, caches et appels p
 il ne mesure pas la répétition du contexte et n'est plus utilisé pour présenter
 l'efficacité des appels. `tokens_per_validated_artifact` reste un champ de
 compatibilité, pas une mesure de rentabilité d'une modification.
+
+
+### Réponse au diagnostic de contexte croissant
+
+Les marqueurs de cache sont ajoutés après liaison des outils, car un nouvel
+appel à `bind_tools` peut perdre les options d'une liaison précédente. Un test
+avec client simulé inspecte la requête Converse effective. La projection garde
+les préfixes stables et retire les preuves machine de manière déterministe.
+Les lectures et écritures de cache sont distinguées des entrées ordinaires, y
+compris les champs de création par TTL. Le nombre total de jetons peut rester
+élevé lorsque leur traitement utilise le cache ; ce total n'est pas une facture.
+
+Une tâche d'édition sans écriture prouvée reste à revoir. Une sortie tronquée
+sans écriture est incomplète, avec son texte conservé, sans continuation aveugle.
+Une reprise explicite réutilise cette session et demande l'application par outils.
+Une simple troncature de rapport après écriture reste non bloquante. Les anciens
+ledgers portant une édition observée mais déclarée terminée sont réconciliés au
+chargement. La synthèse des éditions inabouties est déterministe ; leur code
+conservé est consultable dans un panneau replié et n'est pas envoyé à un autre
+modèle pour un rapport final coûteux.
+
+Sources de compatibilité : documentation AWS Prompt caching et intégration
+ChatBedrock de LangChain. Validation sans fournisseur : 69 tests avant l'ajout
+du contrôle de migration, puis vérification ciblée de ce contrôle. Les économies
+réelles demandent un prochain run avec des lectures de cache non nulles.

@@ -36,8 +36,13 @@ def inspect_messages(messages):
                           "input_tokens": usage.get("input_tokens"),
                           "output_tokens": usage.get("output_tokens"),
                           "cache_read_tokens": inputs.get("cache_read"),
-                          "cache_write_tokens": inputs.get("cache_creation"),
-                          "reasoning_tokens": outputs.get("reasoning")})
+                          "cache_write_tokens": inputs.get("cache_creation") or (
+                              (inputs.get("ephemeral_5m_input_tokens") or 0) + (inputs.get("ephemeral_1h_input_tokens") or 0)),
+                          "reasoning_tokens": outputs.get("reasoning"),
+                          "stop_reason": (getattr(message, "response_metadata", {}) or {}).get("stopReason")
+                                         or (getattr(message, "response_metadata", {}) or {}).get("stop_reason"),
+                          "tool_calls": [call.get("name") for call in getattr(message, "tool_calls", [])],
+                          "invalid_tool_calls": len(getattr(message, "invalid_tool_calls", []))})
         if kind != "tool":
             continue
         name = getattr(message, "name", None) or "unknown"

@@ -17,7 +17,7 @@ from tools.custom_tools import PROJECT_ROOT, WORKSPACE_ROOT, resolve_workspace_p
 
 from core.models import get_tier, resolve_tier_to_model_alias, sanitize_temperature
 from core.multi_agent.ledger import STATUS_CANCELLED, Task, TaskLedger, TaskMetrics
-from core.multi_agent.coordination import compile_context, workspace_revision, task_paths
+from core.multi_agent.coordination import compile_context, workspace_revision, task_paths, UNAPPLIED_EDIT_BLOCKER
 from core.multi_agent.roles import worker_system_prompt, worker_task_prompt
 from llm_engine import create_chat_model, get_workspace_editor_agent, get_workspace_reader_agent
 
@@ -671,6 +671,10 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                                root=PROJECT_ROOT / ".agent_state", run_budget=config.budget, cancel_event=cancel_event,
                                context_update=context, check_paths=set(config.check_paths),
                                artifacts={key: value for key, value in config.artifacts.items() if key in task.dependencies})
+    if task.attempt_count > 1 and task.artifact and UNAPPLIED_EDIT_BLOCKER in task.artifact.blockers:
+        session.context_update += (f"\nReprise explicite {task.attempt_count} : aucun changement appliqué lors de la tentative précédente. "
+                                   "Réutilise le contenu conservé et applique les modifications avec les outils, "
+                                   "par patchs ciblés. Ne réécris pas le code dans un rapport.")
     legacy = hashlib.sha256(json.dumps([task.title, task.description, task.acceptance_criteria,
                                         task.expected_output, result.model_alias, context,
                                         {key: value for key, value in config.artifacts.items() if key in task.dependencies}],
@@ -754,7 +758,20 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
                     output = invoke_model_with_continuation(
                         model, [("system", system_prompt), ("user", task_prompt)]
                     )
-            deliverable = _merge_tool_evidence(output.text.strip(), output, preserve_text=mode in {"lecture", "redaction"})
+            writes_applied = any(item.get("kind") == "file_write" and item.get("ok") is True
+                                 and item.get("applied") is True for item in output.tool_evidence)
+            unapplied_edit = mode == "edition" and not writes_applied
+            deliverable = _merge_tool_evidence(output.text, output,
+                                               preserve_text=mode in {"lecture", "redaction"} or unapplied_edit)
+            if unapplied_edit:
+                try:
+                    pending = json.loads(deliverable)
+                except (ValueError, TypeError):
+                    pending = None
+                if not isinstance(pending, dict):
+                    pending = {"summary": "Contenu généré, modifications non appliquées.", "result": output.text}
+                pending.setdefault("blockers", []).append(UNAPPLIED_EDIT_BLOCKER)
+                deliverable = json.dumps(pending, ensure_ascii=False)
             if not deliverable:
                 raise ValueError("Le modele a renvoye un livrable vide.")
             result.truncated = output.truncated
@@ -794,9 +811,10 @@ def run_single_task(task: Task, context: str = "", config: WorkerExecutionConfig
             result.metrics.target_output_exceeded = bool(
                 len(output.text) > TARGET_OUTPUT_TOKENS * 4
             )
-            if output.truncated and mode in {"redaction", "lecture"}:
+            if output.truncated and (mode in {"redaction", "lecture"} or unapplied_edit):
                 result.error_type = "IncompleteOutput"
-                result.error = "Livrable textuel incomplet après les continuations autorisées ; contenu partiel conservé."
+                result.error = ("Modification non appliquée et sortie tronquée ; contenu conservé sans relance automatique."
+                                if unapplied_edit else "Livrable textuel incomplet après les continuations autorisées ; contenu partiel conservé.")
             _emit(
                 progress,
                 "worker",

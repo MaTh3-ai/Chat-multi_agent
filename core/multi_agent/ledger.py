@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from core.multi_agent.coordination import (
     Artifact,
+    UNAPPLIED_EDIT_BLOCKER,
     Evidence,
     STATE_RANK,
     parse_worker_envelope,
@@ -299,8 +300,19 @@ class TaskLedger:
             self.updated_at = utc_now_iso()
         return released
 
+    def reconcile_edit_evidence(self) -> None:
+        """Also correct old saved runs which declared an unapplied edit done."""
+        for task in self.tasks:
+            artifact = task.artifact
+            if (task.status == STATUS_DONE and artifact and artifact.state == "observed"
+                    and {"write", "propose_write"} & set(task.capabilities)):
+                if UNAPPLIED_EDIT_BLOCKER not in artifact.blockers:
+                    artifact.blockers.append(UNAPPLIED_EDIT_BLOCKER)
+                task.status = STATUS_REVIEW
+
     def sync_artifact_states(self) -> None:
         """Réconcilie les artefacts proposés avec l'état réel des propositions."""
+        self.reconcile_edit_evidence()
         for task in self.tasks:
             artifact = task.artifact
             if artifact and artifact.tested and (not artifact.validation_files or any(
@@ -448,6 +460,9 @@ class TaskLedger:
         # same file resolves an earlier failed attempt without another review.
         latest_writes = {item.reference: item for item in actual if item.kind == "file_write"}
         unresolved = [item.reference for item in latest_writes.values() if item.ok is not True]
+        if (trusted_evidence is not None and {"write", "propose_write"} & set(task.capabilities)
+                and not writes and UNAPPLIED_EDIT_BLOCKER not in task.artifact.blockers):
+            task.artifact.blockers.append(UNAPPLIED_EDIT_BLOCKER)
         if unresolved:
             task.artifact.blockers.append("Écriture non aboutie : " + ", ".join(unresolved))
         self.set_status(task_id, STATUS_REVIEW if task.artifact.blockers else STATUS_DONE)
@@ -653,4 +668,6 @@ class TaskLedger:
         payload["coordination_metrics"] = TaskMetrics(**payload.get("coordination_metrics", {}))
         payload["tasks"] = [Task.from_dict(item) for item in payload.get("tasks", [])]
         payload["events"] = [Event(**item) for item in payload.get("events", [])]
-        return cls(**payload)
+        ledger = cls(**payload)
+        ledger.reconcile_edit_evidence()
+        return ledger
